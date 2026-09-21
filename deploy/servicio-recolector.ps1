@@ -30,9 +30,40 @@ function EsAdministrador {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function PuertoDelEnv {
+    # El recolector escucha donde diga HTTP_PORT. Si aqui se diera por hecho el
+    # 9100, en un servidor con otro puerto la verificacion de salud diria que
+    # no responde y parecria que el servicio no arranco.
+    $archivo = Join-Path $APP ".env"
+    if (Test-Path $archivo) {
+        $linea = Get-Content $archivo |
+                 Where-Object { $_ -match '^\s*HTTP_PORT\s*=\s*(\d+)' } |
+                 Select-Object -Last 1
+        if ($linea -match '^\s*HTTP_PORT\s*=\s*(\d+)') { return [int]$Matches[1] }
+    }
+    return 9100
+}
+
+function Salud($puerto, $segundos) {
+    # -UseBasicParsing y un timeout corto: sin esto, con un proxy de sistema
+    # configurado la llamada se queda colgada y el script nunca termina.
+    try {
+        $r = Invoke-WebRequest "http://localhost:$puerto/health" `
+                 -TimeoutSec $segundos -UseBasicParsing -Proxy $null
+        return $r.Content
+    } catch {
+        return $null
+    }
+}
+
 function PythonDelEntorno {
-    # La ruta del venv es distinta en cada maquina; que la diga poetry en vez
-    # de escribirla a mano en el README.
+    # Primero el entorno junto al codigo. Es el que conviene para el servicio, y
+    # ademas 'poetry env info' sigue devolviendo el del cache mientras ese exista:
+    # virtualenvs.in-project solo aplica a entornos NUEVOS, no mueve el que ya hay.
+    $local = Join-Path $APP ".venv\Scripts\python.exe"
+    if (Test-Path $local) { return $local }
+
+    # Si no, que poetry diga cual es: la ruta del cache cambia en cada maquina.
     Push-Location $APP
     try { $py = (& poetry env info --executable 2>$null | Select-Object -First 1) }
     finally { Pop-Location }
@@ -62,10 +93,20 @@ if ($Accion -eq "estado") {
         $sueltos | ForEach-Object { "   PID $($_.ProcessId)" }
     }
 
-    try {
-        $h = Invoke-WebRequest "http://localhost:9100/health" -TimeoutSec 3 -UseBasicParsing
-        ""; "salud: $($h.Content)"
-    } catch { ""; "el puerto 9100 no responde" }
+    $puerto = PuertoDelEnv
+    $salud = Salud $puerto 3
+    ""
+    if ($salud) {
+        "salud (puerto $puerto): $salud"
+    } elseif ($svc -and $svc.Status -eq "Running") {
+        # El caso enganioso: Windows lo da por arriba y el recolector no atiende.
+        "el puerto $puerto no responde, aunque el servicio dice Running."
+        "Eso es que el proceso arranco y murio, o sigue levantando. Revisa:"
+        "   Get-Content `"$APP\logs\servicio.err`" -Tail 20"
+        "   Get-Content `"$APP\logs\supervisor.log`" -Tail 20"
+    } else {
+        "el puerto $puerto no responde (no hay recolector atendiendo)"
+    }
     return
 }
 
@@ -110,14 +151,34 @@ New-Item -ItemType Directory -Force $logs | Out-Null
 "proyecto : $APP"
 "python   : $python"
 
-if ($python -like "$env:USERPROFILE*") {
+# El entorno junto al codigo esta bien aunque el proyecto viva en un perfil:
+# lo que importa es que no ande suelto en el cache de Poetry, que es lo que se
+# mueve y se borra sin que nadie se entere.
+$entornoLocal = $python -like "$APP*"
+
+if (-not $entornoLocal -and $python -like "$env:USERPROFILE*") {
     ""
-    "AVISO: el entorno vive dentro del perfil de $env:USERNAME."
+    "AVISO: el entorno esta en el cache de Poetry, dentro del perfil de $env:USERNAME."
     "El servicio corre como LocalSystem y puede no tener acceso ahi."
-    "Lo mas robusto es dejarlo junto al codigo:"
-    "    poetry config virtualenvs.in-project true"
+    ""
+    "Poner virtualenvs.in-project en true NO mueve el entorno que ya existe:"
+    "solo aplica a los nuevos. Hay que borrar el viejo para que lo recree aqui."
+    "Con el servicio detenido:"
+    "    cd `"$APP`""
+    "    poetry env list                 # ver como se llama"
+    "    poetry env remove <ese-nombre>  # por nombre; --all no borra nada"
     "    poetry install"
-    "y volver a correr 'instalar'."
+    "y volver a correr 'instalar'. Debe quedar en $APP\.venv"
+    ""
+}
+elseif ($APP -like "$env:USERPROFILE*") {
+    ""
+    "Nota: el proyecto vive dentro del perfil de $env:USERNAME. Funciona, porque"
+    "LocalSystem entra a los perfiles, pero deja el servicio atado a esa cuenta."
+    "Si algun dia se reconstruye el perfil, el servicio se queda sin codigo."
+    "Lo mas solido es moverlo a una ruta propia (C:\IoTDataPipeline) y, tras"
+    "mover la carpeta, correr 'poetry install' otra vez: el .venv guarda rutas"
+    "absolutas y no sobrevive a la mudanza."
     ""
 }
 
@@ -159,19 +220,31 @@ if (Get-Service -Name $Nombre -ErrorAction SilentlyContinue) {
 & $Nssm set $Nombre AppThrottle     10000   | Out-Null
 
 & $Nssm start $Nombre | Out-Null
-Start-Sleep -Seconds 6
 
 $svc = Get-Service -Name $Nombre -ErrorAction SilentlyContinue
 "servicio : $($svc.Status)  (arranque: $($svc.StartType))"
 
-try {
-    $h = Invoke-WebRequest "http://localhost:9100/health" -TimeoutSec 5 -UseBasicParsing
-    "salud    : $($h.Content)"
+# NSSM dice Running en cuanto lanza el proceso, aunque el recolector truene un
+# segundo despues. Lo unico que prueba que esta vivo es que atienda el puerto,
+# y eso tarda: conexiones a la base, catalogo, primer ciclo de PLCs.
+$puerto = PuertoDelEnv
+"salud    : consultando el puerto $puerto..."
+
+$salud = $null
+foreach ($intento in 1..12) {
+    Start-Sleep -Seconds 5
+    $salud = Salud $puerto 3
+    if ($salud) { break }
+}
+
+if ($salud) {
+    "salud    : $salud"
     ""
     "Listo. Arranca solo con el servidor y sobrevive al cierre de sesion."
-} catch {
+} else {
     ""
-    "El 9100 no responde todavia. Revisa:"
+    "El puerto $puerto no responde despues de un minuto. El servicio dice"
+    "Running, pero el recolector no esta atendiendo. Revisa:"
     "   Get-Content `"$logs\servicio.err`" -Tail 20"
     "   Get-Content `"$logs\supervisor.log`" -Tail 20"
 }

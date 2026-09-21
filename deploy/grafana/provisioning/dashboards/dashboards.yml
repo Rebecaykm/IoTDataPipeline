@@ -12,6 +12,7 @@ providers:
     allowUiUpdates: true
     options:
       # Ruta ABSOLUTA: Grafana no expande rutas relativas aquí.
-      # Es la misma en tu equipo y en el servidor porque la raíz es C:\iot
-      path: __APP__\deploy\grafana\dashboards
+      # Apunta a .generado y no al repositorio porque los tableros también
+      # llevan resuelto el puerto del recolector.
+      path: __GEN__\dashboards
       foldersFromFilesStructure: false

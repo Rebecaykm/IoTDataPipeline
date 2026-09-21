@@ -1,5 +1,8 @@
 # Prometheus: raspa /metrics del servicio cada 15 s.
 # Lo arranca deploy/iniciar-observabilidad.ps1
+#
+# PLANTILLA. Los __PUERTO_*__ los resuelve ese script, que escribe la versión
+# final en deploy\.generado\ (no versionada).
 
 global:
   scrape_interval: 15s
@@ -11,10 +14,10 @@ rule_files:
 scrape_configs:
   - job_name: iotdatapipeline
     static_configs:
-      - targets: ['localhost:9100']
+      - targets: ['localhost:__PUERTO_RECOLECTOR__']
         labels:
           planta: 'principal'
 
   - job_name: prometheus
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['localhost:__PUERTO_PROMETHEUS__']

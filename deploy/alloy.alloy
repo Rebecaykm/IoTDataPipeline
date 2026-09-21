@@ -91,6 +91,6 @@ loki.process "supervisor" {
 // ── Destino ───────────────────────────────────────────────────────────────
 loki.write "local" {
 	endpoint {
-		url = "http://localhost:3100/loki/api/v1/push"
+		url = "http://localhost:__PUERTO_LOKI__/loki/api/v1/push"
 	}
 }

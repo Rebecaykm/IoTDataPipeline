@@ -4,7 +4,7 @@
 auth_enabled: false
 
 server:
-  http_listen_port: 3100
+  http_listen_port: __PUERTO_LOKI__
   grpc_listen_port: 9096
   log_level: warn
 

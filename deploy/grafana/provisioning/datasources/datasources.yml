@@ -1,5 +1,8 @@
-# Fuentes de datos. Grafana las carga sola al arrancar: no hay que darlas de
-# alta a mano. Todo corre en la misma máquina, por eso localhost.
+# PLANTILLA. Los __PUERTO_*__ los resuelve iniciar-observabilidad.ps1, que
+# escribe la versión final en deploy\.generado\ (no versionada).
+#
+# Grafana las carga solas al arrancar: no hay que darlas de alta a mano.
+# Todo corre en la misma máquina, por eso localhost.
 apiVersion: 1
 
 datasources:
@@ -8,7 +11,7 @@ datasources:
     uid: prometheus
     type: prometheus
     access: proxy
-    url: http://localhost:9090
+    url: http://localhost:__PUERTO_PROMETHEUS__
     isDefault: true
     jsonData:
       timeInterval: 15s
@@ -17,7 +20,7 @@ datasources:
     uid: loki
     type: loki
     access: proxy
-    url: http://localhost:3100
+    url: http://localhost:__PUERTO_LOKI__
     jsonData:
       maxLines: 2000
 
@@ -27,7 +30,7 @@ datasources:
     uid: infinity
     type: yesoreyeram-infinity-datasource
     access: proxy
-    url: http://localhost:9100
+    url: http://localhost:__PUERTO_RECOLECTOR__
     jsonData:
       global_queries: []
       is_httpheader: false

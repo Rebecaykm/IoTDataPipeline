@@ -7,6 +7,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# Entorno virtual. Con virtualenvs.in-project=true Poetry lo crea aqui, que es
+# lo que el servicio necesita: LocalSystem no depende de permisos de perfil.
+.venv/
+
 # Estado operativo del servicio — NO versionar.
 # state_cache guarda la línea base de cada contador: si se versiona, un pull en
 # el servidor la sobrescribe con la de otra máquina y se pierde producción real.

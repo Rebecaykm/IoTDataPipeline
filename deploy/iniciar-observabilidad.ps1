@@ -5,6 +5,7 @@
 #   .\iniciar-observabilidad.ps1 -SinRecolector    solo la observabilidad
 #   .\iniciar-observabilidad.ps1 -Visible          con ventanas, para diagnosticar
 #   .\iniciar-observabilidad.ps1 -Obs D:\binarios  binarios en otra ruta
+#   .\iniciar-observabilidad.ps1 -PuertoGrafana 8080   si el 3000 esta ocupado
 #
 # El proyecto se ubica solo (este script vive en <proyecto>\deploy), así que
 # funciona sin importar dónde esté clonado el repositorio.
@@ -16,7 +17,15 @@ param(
     [switch]$Detener,
     [switch]$SinRecolector,   # levantar solo la observabilidad
     [switch]$Visible,         # con ventanas, para diagnosticar
-    [string]$Obs = $env:IOT_OBS
+    [string]$Obs = $env:IOT_OBS,
+
+    # Los puertos se escriben en UN solo lugar: de aquí bajan a las plantillas,
+    # a las fuentes de datos de Grafana y a los enlaces de los tableros.
+    [int]$PuertoGrafana    = 3000,
+    [int]$PuertoPrometheus = 9090,
+    [int]$PuertoLoki       = 3100,
+    [int]$PuertoAlloy      = 12345,
+    [int]$PuertoRecolector = 0     # 0 = tomarlo del .env (HTTP_PORT)
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +36,25 @@ if (-not $Obs) { $Obs = "C:\iot\obs" }
 $OBS = $Obs.TrimEnd('\')
 $GEN  = Join-Path $DEPLOY ".generado"
 $LOGS = Join-Path $OBS "logs"
+
+# El recolector lee HTTP_PORT del .env. Si aquí se pusiera otro número,
+# Prometheus raspa un puerto donde no hay nadie y los tableros salen vacíos sin
+# decir por qué. Por eso se lee del mismo lugar en vez de repetirlo.
+if ($PuertoRecolector -eq 0) {
+    $PuertoRecolector = 9100
+    $archivoEnv = Join-Path $APP ".env"
+    if (Test-Path $archivoEnv) {
+        $linea = Get-Content $archivoEnv |
+                 Where-Object { $_ -match '^\s*HTTP_PORT\s*=\s*(\d+)' } |
+                 Select-Object -Last 1
+        if ($linea -match '^\s*HTTP_PORT\s*=\s*(\d+)') {
+            $PuertoRecolector = [int]$Matches[1]
+        }
+    }
+}
+
+$PUERTOS = @($PuertoGrafana, $PuertoPrometheus, $PuertoLoki,
+             $PuertoAlloy, $PuertoRecolector)
 
 # Los procesos arrancan OCULTOS. Una ventana oculta no deja ver nada si algo
 # truena, asi que la salida de cada uno se guarda en <OBS>\logs\<nombre>.log
@@ -86,7 +114,7 @@ if ($Detener) {
 
     # 4) Red de seguridad: lo que siga escuchando en nuestros puertos
     Start-Sleep -Seconds 2
-    foreach ($puerto in 3000, 9090, 3100, 12345, 9100) {
+    foreach ($puerto in $PUERTOS) {
         Get-NetTCPConnection -LocalPort $puerto -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
             $pr = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
             if ($pr) {
@@ -100,7 +128,7 @@ if ($Detener) {
     if (-not $alguno) { "  no habia nada corriendo" }
 
     Start-Sleep -Seconds 1
-    $sigue = @(3000, 9090, 3100, 12345, 9100) | Where-Object {
+    $sigue = $PUERTOS | Where-Object {
         (Test-NetConnection localhost -Port $_ -WarningAction SilentlyContinue).TcpTestSucceeded
     }
     if ($sigue) { "  AVISO: siguen abiertos los puertos $($sigue -join ', ')" }
@@ -130,17 +158,28 @@ if ($faltan) {
 New-Item -ItemType Directory -Force $GEN | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $GEN "provisioning\dashboards")  | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $GEN "provisioning\datasources") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $GEN "dashboards")               | Out-Null
 
 function Resolver($origen, $destino) {
     # __APP_UNIX__ lleva diagonales normales: el archivo de Alloy usa cadenas
     # estilo Go, donde la diagonal invertida es un escape y "C:\Users\..."
     # rompe el parseo. Windows acepta ambas para rutas de archivo.
     $appUnix = $APP.Replace('\', '/')
-    (Get-Content $origen -Raw).
+    $texto = (Get-Content $origen -Raw).
         Replace('__APP_UNIX__', $appUnix).
         Replace('__APP__', $APP).
-        Replace('__OBS__', $OBS) |
-        Set-Content $destino -Encoding UTF8
+        Replace('__OBS__', $OBS).
+        Replace('__GEN__', $GEN).
+        Replace('__PUERTO_GRAFANA__',    "$PuertoGrafana").
+        Replace('__PUERTO_PROMETHEUS__', "$PuertoPrometheus").
+        Replace('__PUERTO_LOKI__',       "$PuertoLoki").
+        Replace('__PUERTO_ALLOY__',      "$PuertoAlloy").
+        Replace('__PUERTO_RECOLECTOR__', "$PuertoRecolector")
+
+    # Sin BOM a propósito: Set-Content -Encoding UTF8 lo agrega en Windows
+    # PowerShell 5.1, y el lector de JSON de Grafana truena con él.
+    [System.IO.File]::WriteAllText(
+        $destino, $texto, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 Resolver (Join-Path $DEPLOY "loki.yml")       (Join-Path $GEN "loki.yml")
@@ -149,8 +188,13 @@ Resolver (Join-Path $DEPLOY "prometheus.yml") (Join-Path $GEN "prometheus.yml")
 Copy-Item (Join-Path $DEPLOY "alertas.yml")   (Join-Path $GEN "alertas.yml") -Force
 Resolver (Join-Path $DEPLOY "grafana\provisioning\dashboards\dashboards.yml") `
          (Join-Path $GEN "provisioning\dashboards\dashboards.yml")
-Copy-Item (Join-Path $DEPLOY "grafana\provisioning\datasources\datasources.yml") `
-          (Join-Path $GEN "provisioning\datasources\datasources.yml") -Force
+Resolver (Join-Path $DEPLOY "grafana\provisioning\datasources\datasources.yml") `
+         (Join-Path $GEN "provisioning\datasources\datasources.yml")
+
+# Los tableros pasan por aquí porque uno enlaza al recolector por su puerto.
+Get-ChildItem (Join-Path $DEPLOY "grafana\dashboards") -Filter *.json | ForEach-Object {
+    Resolver $_.FullName (Join-Path $GEN "dashboards\$($_.Name)")
+}
 "  configuracion generada en $GEN"
 
 # ── Carpetas de datos (fuera del repositorio) ──────────────────────────────
@@ -163,28 +207,32 @@ foreach ($sub in @("datos", "datos\loki", "datos\prometheus", "datos\alloy", "lo
 Arrancar "prometheus" (Join-Path $OBS "prometheus\prometheus.exe") @(
     "--config.file=$(Join-Path $GEN 'prometheus.yml')",
     "--storage.tsdb.path=$(Join-Path $OBS 'datos\prometheus')",
-    "--storage.tsdb.retention.time=90d"
+    "--storage.tsdb.retention.time=90d",
+    "--web.listen-address=:$PuertoPrometheus"
 )
-"  Prometheus  -> http://localhost:9090"
+"  Prometheus  -> http://localhost:$PuertoPrometheus"
 
 Arrancar "loki" (Join-Path $OBS "loki\loki-windows-amd64.exe") @(
     "-config.file=$(Join-Path $GEN 'loki.yml')"
 )
-"  Loki        -> http://localhost:3100"
+"  Loki        -> http://localhost:$PuertoLoki"
 
 Start-Sleep -Seconds 3   # Alloy necesita que Loki ya escuche
 
 Arrancar "alloy" (Join-Path $OBS "alloy\alloy-windows-amd64.exe") @(
     "run", "$(Join-Path $GEN 'alloy.alloy')",
     "--storage.path=$(Join-Path $OBS 'datos\alloy')",
-    "--server.http.listen-addr=127.0.0.1:12345"
+    "--server.http.listen-addr=127.0.0.1:$PuertoAlloy"
 )
-"  Alloy       -> leyendo $APP\logs\*.log   (http://localhost:12345)"
+"  Alloy       -> leyendo $APP\logs\*.log   (http://localhost:$PuertoAlloy)"
 
+# La variable de entorno le gana al custom.ini, asi que el puerto se manda
+# desde aqui sin editar la configuracion de Grafana en cada maquina.
+$env:GF_SERVER_HTTP_PORT = "$PuertoGrafana"
 Arrancar "grafana" (Join-Path $OBS "grafana\bin\grafana.exe") @(
     "server", "--homepath", (Join-Path $OBS "grafana")
 )
-"  Grafana     -> http://localhost:3000  (admin / admin)"
+"  Grafana     -> http://localhost:$PuertoGrafana  (admin / admin)"
 
 # ── El recolector ──────────────────────────────────────────────────────────
 if (-not $SinRecolector) {
@@ -194,7 +242,7 @@ if (-not $SinRecolector) {
         "  Recolector  -> ya estaba corriendo (PID $($yaCorre.ProcessId -join ', '))"
     } else {
         Arrancar "recolector" "poetry" @("run", "python", "Prensas.py") $APP
-        "  Recolector  -> http://localhost:9100/estaciones/lecturas"
+        "  Recolector  -> http://localhost:$PuertoRecolector/estaciones/lecturas"
     }
 }
 

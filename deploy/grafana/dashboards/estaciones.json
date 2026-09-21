@@ -750,7 +750,7 @@
                 "value": [
                   {
                     "title": "Ver bloque crudo del PLC",
-                    "url": "http://localhost:9100/debug/plc/${__value.raw}",
+                    "url": "http://localhost:__PUERTO_RECOLECTOR__/debug/plc/${__value.raw}",
                     "targetBlank": true
                   }
                 ]

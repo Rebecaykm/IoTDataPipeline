@@ -59,6 +59,32 @@ Si prefieres los binarios en otra ruta:
 [Environment]::SetEnvironmentVariable("IOT_OBS", "D:\binarios", "User")
 ```
 
+### Los puertos
+
+| Pieza | Por omisión | Parámetro |
+|---|---:|---|
+| Grafana | 3000 | `-PuertoGrafana` |
+| Prometheus | 9090 | `-PuertoPrometheus` |
+| Loki | 3100 | `-PuertoLoki` |
+| Alloy | 12345 | `-PuertoAlloy` |
+| Recolector | 9100 | `HTTP_PORT` del `.env` |
+
+Si alguno está ocupado en el servidor:
+
+```powershell
+.\iniciar-observabilidad.ps1 -PuertoGrafana 8080 -PuertoLoki 3200
+```
+
+Van juntos a propósito. Un puerto aparece en cinco lugares —el proceso que
+escucha, lo que Prometheus raspa, las fuentes de datos de Grafana, a dónde
+empuja Alloy y el enlace del tablero de estaciones— y si uno se queda atrás,
+Grafana levanta bien pero con paneles vacíos y nada dice por qué. Por eso se
+escriben **una sola vez** aquí y el script los baja a las plantillas.
+
+**El del recolector no se pasa por parámetro**: el script lo lee del `HTTP_PORT`
+del `.env`, que es de donde lo toma el propio recolector. Repetirlo sería
+justamente la forma de desincronizarlo.
+
 ---
 
 ## Paso 1 — el proyecto
