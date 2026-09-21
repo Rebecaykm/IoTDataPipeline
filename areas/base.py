@@ -27,8 +27,9 @@ class AreaPipeline:
 
     nombre = "general"
 
-    # Piezas por golpe. Fuera de Estampado un golpe es una pieza, así que no se
-    # consulta el atributo `pieces_per_shot` y el multiplicador es siempre 1.
+    # Piezas por golpe. Solo Estampado cuenta golpes; en las demás áreas el
+    # contador del PLC ya cuenta piezas, así que no se consulta el atributo
+    # `pieces_per_shot` y el multiplicador es siempre 1.
     usa_multiplicador = False
 
     def resolver_partes(self, raw: str, ctx: ContextoArea) -> Tuple[List[str], Optional[str]]:

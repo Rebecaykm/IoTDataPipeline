@@ -45,8 +45,9 @@ produccion_piezas = Counter(
     "produccion_piezas_total", "Piezas registradas en production_records",
     ["estacion", "lado", "area"],
 )
-produccion_golpes = Counter(
-    "produccion_golpes_total", "Incremento crudo del contador (golpes o piezas según el área)",
+produccion_conteo = Counter(
+    "produccion_conteo_total",
+    "Incremento crudo del contador: golpes en Estampado, piezas en las demás áreas",
     ["estacion", "lado", "area"],
 )
 partes_rechazadas = Counter(
@@ -57,9 +58,13 @@ resets_contador = Counter(
     "resets_contador_total", "Reinicios del contador del PLC detectados",
     ["estacion", "lado"],
 )
-cambios_turno = Counter(
-    "cambios_turno_total", "Cambios de turno procesados",
-    ["estacion"],
+ordenes_completadas = Counter(
+    "ordenes_completadas_total", "Órdenes que llegaron a su cantidad planeada",
+    ["estacion", "area"],
+)
+produccion_no_planeada = Counter(
+    "produccion_no_planeada_total", "Piezas producidas sin una orden que las respalde",
+    ["estacion", "lado", "area"],
 )
 
 # ── Estado clasificado (para alertar sin leer el snapshot) ─────────────────

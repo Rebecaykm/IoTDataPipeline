@@ -1,8 +1,9 @@
 # Levanta TODO: Prometheus, Loki, Alloy, Grafana y el recolector.
 #
-#   .\iniciar-observabilidad.ps1                   arrancar todo
+#   .\iniciar-observabilidad.ps1                   arrancar todo (sin ventanas)
 #   .\iniciar-observabilidad.ps1 -Detener          detener todo
 #   .\iniciar-observabilidad.ps1 -SinRecolector    solo la observabilidad
+#   .\iniciar-observabilidad.ps1 -Visible          con ventanas, para diagnosticar
 #   .\iniciar-observabilidad.ps1 -Obs D:\binarios  binarios en otra ruta
 #
 # El proyecto se ubica solo (este script vive en <proyecto>\deploy), así que
@@ -14,6 +15,7 @@
 param(
     [switch]$Detener,
     [switch]$SinRecolector,   # levantar solo la observabilidad
+    [switch]$Visible,         # con ventanas, para diagnosticar
     [string]$Obs = $env:IOT_OBS
 )
 
@@ -23,7 +25,25 @@ $APP    = Split-Path -Parent $PSScriptRoot
 $DEPLOY = $PSScriptRoot
 if (-not $Obs) { $Obs = "C:\iot\obs" }
 $OBS = $Obs.TrimEnd('\')
-$GEN = Join-Path $DEPLOY ".generado"
+$GEN  = Join-Path $DEPLOY ".generado"
+$LOGS = Join-Path $OBS "logs"
+
+# Los procesos arrancan OCULTOS. Una ventana oculta no deja ver nada si algo
+# truena, asi que la salida de cada uno se guarda en <OBS>\logs\<nombre>.log
+# y .err. Con -Visible salen en ventana, que es lo util cuando algo falla.
+$estiloVentana = if ($Visible) { "Minimized" } else { "Hidden" }
+
+function Arrancar($nombre, $exe, $argumentos, $directorio) {
+    $opciones = @{
+        FilePath               = $exe
+        ArgumentList           = $argumentos
+        WindowStyle            = $estiloVentana
+        RedirectStandardOutput = (Join-Path $LOGS "$nombre.log")
+        RedirectStandardError  = (Join-Path $LOGS "$nombre.err")
+    }
+    if ($directorio) { $opciones.WorkingDirectory = $directorio }
+    Start-Process @opciones
+}
 
 # Ojo con los nombres de proceso: Loki y Alloy corren como
 # 'loki-windows-amd64' y 'alloy-windows-amd64', no como 'loki' / 'alloy'.
@@ -134,34 +154,34 @@ Copy-Item (Join-Path $DEPLOY "grafana\provisioning\datasources\datasources.yml")
 "  configuracion generada en $GEN"
 
 # ── Carpetas de datos (fuera del repositorio) ──────────────────────────────
-foreach ($sub in @("datos", "datos\loki", "datos\prometheus", "datos\alloy")) {
+foreach ($sub in @("datos", "datos\loki", "datos\prometheus", "datos\alloy", "logs")) {
     New-Item -ItemType Directory -Force (Join-Path $OBS $sub) | Out-Null
 }
 
 # ── Arrancar ───────────────────────────────────────────────────────────────
 ""
-Start-Process (Join-Path $OBS "prometheus\prometheus.exe") -WindowStyle Minimized -ArgumentList @(
+Arrancar "prometheus" (Join-Path $OBS "prometheus\prometheus.exe") @(
     "--config.file=$(Join-Path $GEN 'prometheus.yml')",
     "--storage.tsdb.path=$(Join-Path $OBS 'datos\prometheus')",
     "--storage.tsdb.retention.time=90d"
 )
 "  Prometheus  -> http://localhost:9090"
 
-Start-Process (Join-Path $OBS "loki\loki-windows-amd64.exe") -WindowStyle Minimized -ArgumentList @(
+Arrancar "loki" (Join-Path $OBS "loki\loki-windows-amd64.exe") @(
     "-config.file=$(Join-Path $GEN 'loki.yml')"
 )
 "  Loki        -> http://localhost:3100"
 
 Start-Sleep -Seconds 3   # Alloy necesita que Loki ya escuche
 
-Start-Process (Join-Path $OBS "alloy\alloy-windows-amd64.exe") -WindowStyle Minimized -ArgumentList @(
+Arrancar "alloy" (Join-Path $OBS "alloy\alloy-windows-amd64.exe") @(
     "run", "$(Join-Path $GEN 'alloy.alloy')",
     "--storage.path=$(Join-Path $OBS 'datos\alloy')",
     "--server.http.listen-addr=127.0.0.1:12345"
 )
 "  Alloy       -> leyendo $APP\logs\*.log   (http://localhost:12345)"
 
-Start-Process (Join-Path $OBS "grafana\bin\grafana.exe") -WindowStyle Minimized -ArgumentList @(
+Arrancar "grafana" (Join-Path $OBS "grafana\bin\grafana.exe") @(
     "server", "--homepath", (Join-Path $OBS "grafana")
 )
 "  Grafana     -> http://localhost:3000  (admin / admin)"
@@ -173,8 +193,7 @@ if (-not $SinRecolector) {
     if ($yaCorre) {
         "  Recolector  -> ya estaba corriendo (PID $($yaCorre.ProcessId -join ', '))"
     } else {
-        Start-Process "poetry" -WindowStyle Minimized -WorkingDirectory $APP `
-            -ArgumentList "run", "python", "Prensas.py"
+        Arrancar "recolector" "poetry" @("run", "python", "Prensas.py") $APP
         "  Recolector  -> http://localhost:9100/estaciones/lecturas"
     }
 }

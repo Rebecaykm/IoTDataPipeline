@@ -52,8 +52,8 @@ class TestRegistro:
 
 
 class TestAreaGeneral:
-    def test_expande_numero_con_diagonal(self):
-        numeros, error = AreaPipeline().resolver_partes("DGH9 53 83 XB/ZB", ctx())
+    def test_expande_numero_con_guion_bajo(self):
+        numeros, error = AreaPipeline().resolver_partes("DGH9 53 83 XB_ZB", ctx())
         assert numeros == ["DGH95383XB", "DGH95383ZB"]
         assert error is None
 
@@ -183,6 +183,6 @@ class TestAgregarUnAreaNueva:
         p = PinturaPipeline()
         assert p.extras_history({"cabina": 3}) == {"sequence": 3}
         # y lo que no sobreescribe sigue siendo el comportamiento general
-        assert p.resolver_partes("ABC 12/34", ctx())[0] == ["ABC12", "ABC34"]
+        assert p.resolver_partes("ABC 12_34", ctx())[0] == ["ABC12", "ABC34"]
         # las demás áreas no se enteran
         assert AreaPipeline().extras_history({"cabina": 3}) == {}

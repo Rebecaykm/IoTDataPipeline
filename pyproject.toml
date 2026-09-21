@@ -22,7 +22,12 @@ dependencies = [
 ]
 
 [tool.poetry]
-packages = [{include = "iotdatapipeline", from = "src"}]
+# Esto es un SERVICIO que se ejecuta por script (poetry run python Prensas.py),
+# no una librería que alguien instale. Sin esto, Poetry busca instalar el
+# paquete src/iotdatapipeline —que nunca existió, es resto de `poetry new`— y
+# `poetry install` falla en una máquina limpia con:
+#     src\iotdatapipeline does not contain any element
+package-mode = false
 
 
 [tool.poetry.group.dev.dependencies]

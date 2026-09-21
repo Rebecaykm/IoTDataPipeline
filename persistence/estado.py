@@ -4,14 +4,29 @@ Persistencia del estado de contadores en disco (state_cache/).
 Este archivo guarda la LÍNEA BASE de cada contador: sin él, al arrancar no se
 sabe desde dónde contar y se pierde la producción del hueco. Por eso la
 escritura es atómica.
+
+Qué guarda cada entrada:
+    contador_registro  desde qué valor del contador se cuentan los deltas
+    multiplicador      piezas por golpe vigente (solo cambia en Estampado)
+    id_en_curso        la orden que se está llenando, para poder cerrarla si la
+                       corrida termina de golpe
+    numero_original    lo que mandó el PLC, sin resolver
+    lado               LH / RH / --
+    part_number_id     id de la parte, resuelto una vez por corrida
 """
 
 import json
 import logging
 import os
-from datetime import datetime, time
+from datetime import datetime
 
 logger = logging.getLogger("supervisor")
+
+#: Campos que escribía el modelo por día y turno. Ya no los produce ni los lee
+#: nadie, pero siguen en los archivos de estado anteriores al cambio.
+OBSOLETOS = ("id_registro", "hora_cambio", "quantity_planeada",
+             "necesita_production_start", "error_bd", "registro_creado",
+             "delta_inicial", "cerrado_por_turno")
 
 
 def guardar_estado(state_file, active_records, ip):
@@ -27,17 +42,8 @@ def guardar_estado(state_file, active_records, ip):
     """
     tmp_path = state_file.with_suffix('.json.tmp')
     try:
-        serializable_data = {}
-        for clave, record in active_records.items():
-            rec_copy = record.copy()
-            if isinstance(rec_copy.get('hora_cambio'), time):
-                rec_copy['hora_cambio'] = rec_copy['hora_cambio'].strftime("%H:%M:%S")
-            if rec_copy.get('id_registro') is None:
-                rec_copy['id_registro'] = 0
-            serializable_data[clave] = rec_copy
-
         with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(serializable_data, f, indent=4, ensure_ascii=False)
+            json.dump(active_records, f, indent=4, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())  # forzar a disco antes del rename
 
@@ -68,8 +74,11 @@ def cargar_estado(state_file, ip):
 
         for clave, record in data.items():
             try:
-                h_str = record.get('hora_cambio', '00:00:00')
-                record['hora_cambio'] = datetime.strptime(h_str, "%H:%M:%S").time()
+                # Restos del modelo por día y turno: los archivos anteriores al
+                # cambio los traen y nadie los lee. Se descartan al cargar, así
+                # el siguiente guardado deja el archivo limpio solo.
+                for obsoleto in OBSOLETOS:
+                    record.pop(obsoleto, None)
 
                 # 🛡️ MIGRACIÓN DE JSON ANTIGUO: añadir '_GLOBAL' si la llave no trae lado
                 if not any(clave.endswith(suf) for suf in

@@ -12,7 +12,7 @@ def calcular_incremento(contador_previo: int, contador_actual: int) -> Tuple[int
     El contador del PLC se reinicia cuando el operador termina una corrida y
     arranca otra con la misma parte. Si el contador bajó, lo producido antes del
     reinicio ya está acumulado en la base de datos, así que el valor nuevo son
-    golpes de la corrida nueva y se cuentan completos.
+    avance de la corrida nueva y se cuenta completo.
 
     >>> calcular_incremento(20, 23)
     (3, False)
@@ -32,7 +32,7 @@ def calcular_delta_turno(contador_previo: int, contador_actual: int) -> Tuple[in
 
     Si el PLC reinició su contador justo en la frontera del turno, la resta daría
     negativo: se fuerza a 0 para no escribir producción negativa. Se pierden los
-    golpes de ese instante, que es preferible a corromper el registro.
+    avance de ese instante, que es preferible a corromper el registro.
 
     >>> calcular_delta_turno(500, 502)
     (2, False)

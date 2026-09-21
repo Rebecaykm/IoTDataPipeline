@@ -17,7 +17,7 @@ class TestIncremento:
         assert calcular_incremento(20, 23) == (3, False)
 
     def test_sin_avance(self):
-        """Contador detenido: la prensa no golpeó."""
+        """Contador detenido: la estación no produjo nada."""
         assert calcular_incremento(150, 150) == (0, False)
 
     def test_reset_a_cero(self):

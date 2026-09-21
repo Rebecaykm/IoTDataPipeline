@@ -1,4 +1,3 @@
-import pandas as pd
 import datetime
 import time as system_time
 from pymcprotocol import Type3E
@@ -23,7 +22,7 @@ from logging.handlers import RotatingFileHandler
 import signal
 
 # Lógica de negocio pura (sin PLC ni BD). Ver domain/__init__.py
-from domain.contadores import calcular_incremento, calcular_delta_turno, piezas_producidas
+from domain.contadores import calcular_incremento
 from domain import turnos as _turnos
 
 # Comportamiento por área. Agregar un área = una clase + una línea. Ver areas/
@@ -40,11 +39,13 @@ from observabilidad.estado import REGISTRO, motivo_de_error
 from observabilidad.rechazos import RechazosStore
 from observabilidad.lecturas import LECTURAS
 
-# Acceso a datos. Todo el SQL vive en persistence/repositorio.py
+# Acceso a datos. El SQL vive en persistence/: repositorio.py lo general y
+# ordenes.py todo lo de shop orders (buscar, llenar, cerrar).
 from persistence import repositorio as repo
+from persistence import ordenes
 from persistence import estado as estado_store
 from persistence import catalogo
-from persistence.repositorio import actualizar_registro, obtener_part_number_id
+from persistence.repositorio import obtener_part_number_id
 
 # ═══════════════════════════ CONFIGURACIÓN GLOBAL ═══════════════════════════
 
@@ -65,14 +66,20 @@ logger = logging.getLogger("supervisor")
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
+# Rotación de logs: 10 MB por archivo y 7 respaldos = 80 MB por estación.
+# Con 109 estaciones son ~8.5 GB de tope; antes eran 100 MB x 2 = 300 MB por
+# estación, o sea 32 GB, y un disco lleno detiene el recolector.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_RESPALDOS = 7
+
 # 🔄 Handler con rotación para el logger principal
 supervisor_log_path = LOGS_DIR / "supervisor.log"
 supervisor_file_handler = RotatingFileHandler(
     supervisor_log_path,
     mode='a',
     encoding='utf-8',
-    maxBytes=100*1024*1024,  # 10 MB
-    backupCount=2           # 5 backups
+    maxBytes=LOG_MAX_BYTES,
+    backupCount=LOG_RESPALDOS,
 )
 supervisor_file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -108,6 +115,41 @@ RECONNECT_DELAY = 10        # 10 segundos entre reconexiones fallidas
 # dos hilos nunca comparten una conexión (ver ConnectionPool).
 PLC_IO_WORKERS = int(os.getenv('PLC_IO_WORKERS', '16'))  # 1 hilo por PLC concurrente
 DB_WORKERS = int(os.getenv('DB_WORKERS', '8'))           # limita conexiones SQL vivas
+
+# Fecha límite hacia atrás para rescatar órdenes pendientes: no se toca ninguna
+# orden planeada ANTES de este día. Es una fecha fija, no una ventana móvil, para
+# que el corte no se recorra solo con el paso de los días.
+# La orden que se está llenando se retoma siempre, sin importar su fecha.
+ORDENES_DESDE_DEFECTO = date(2000, 1, 1)
+
+
+def _fecha_limite_ordenes():
+    """
+    Lee ORDENES_DESDE del .env como 'AAAA-MM-DD'.
+
+    Si falta o viene mal, se usa una fecha muy antigua a propósito: con un corte
+    demasiado reciente el recolector no encontraría NINGUNA orden y mandaría
+    toda la producción a No planeado, en silencio. Es preferible rescatar
+    órdenes viejas —que se ven y se corrigen— a perder el enlace con el plan.
+    """
+    crudo = (os.getenv('ORDENES_DESDE') or '').strip()
+    if not crudo:
+        logger.warning(
+            "⚠️ ORDENES_DESDE no está en el .env: se rescatarán órdenes desde "
+            f"{ORDENES_DESDE_DEFECTO}. Ponle la fecha de corte que corresponda."
+        )
+        return ORDENES_DESDE_DEFECTO
+    try:
+        return datetime.strptime(crudo, '%Y-%m-%d').date()
+    except ValueError:
+        logger.error(
+            f"❌ ORDENES_DESDE='{crudo}' no tiene el formato AAAA-MM-DD. "
+            f"Se usa {ORDENES_DESDE_DEFECTO} para no perder producción."
+        )
+        return ORDENES_DESDE_DEFECTO
+
+
+ORDENES_DESDE = _fecha_limite_ordenes()
 
 _plc_executor = ThreadPoolExecutor(max_workers=PLC_IO_WORKERS, thread_name_prefix="plc-io")
 _db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="db")
@@ -421,19 +463,6 @@ def get_current_shift(current_time: time) -> Tuple[int, date]:
     # entorno (configuración cargada de la BD y la fecha de hoy).
     return _turnos.get_current_shift(current_time, SHIFTS_CONFIG, date.today())
 
-def has_shift_changed(previous_time: time, current_time: time) -> bool:
-    """
-    Verifica si hubo un cambio de turno entre dos horas.
-
-    Args:
-        previous_time: Hora anterior
-        current_time: Hora actual
-
-    Returns:
-        True si hubo cambio de turno
-    """
-    return _turnos.has_shift_changed(previous_time, current_time, SHIFTS_CONFIG)
-
 def safe_get_current_shift(current_time: time) -> Tuple[int, date]:
     """
     Versión segura que maneja cambios en configuración de turnos.
@@ -485,14 +514,12 @@ def get_station_logger(estacion):
 
     log_path = LOGS_DIR / f"{estacion}.log"
 
-    # 🔄 CAMBIO: Usar RotatingFileHandler en lugar de FileHandler
-    # Tamaño máximo: 10 MB por archivo, mantener 5 archivos de backup
     file_handler = RotatingFileHandler(
         log_path,
         mode='a',
         encoding='utf-8',
-        maxBytes=100*1024*1024,  # 10 MB
-        backupCount=2           # mantener hasta 5 archivos de respaldo
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_RESPALDOS,
     )
     file_handler.setLevel(logging.INFO)  # Solo WARNING y ERROR
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -603,16 +630,14 @@ def load_config():
         return {}
     # NOTA: No cerramos la conexión aquí, el pool la maneja
 
-# El SQL vive en persistence/repositorio.py. Quién consulta el multiplicador lo
-# decide el ÁREA: solo Estampado lee pieces_per_shot (antes venía de AS400).
+# Quién consulta el multiplicador lo decide el ÁREA: solo Estampado lee
+# pieces_per_shot (antes venía de AS400); las demás cuentan una pieza por golpe.
 def lector_multiplicador(pipeline):
     """Devuelve la función que el repositorio usará para el multiplicador."""
     if getattr(pipeline, 'usa_multiplicador', False):
         return catalogo.obtener_multiplicador
     return repo._sin_multiplicador
 
-obtener_id_registro_activo = repo.obtener_id_registro_activo
-crear_nuevo_registro = repo.crear_nuevo_registro
 
 # ═══════════════════════════ UTILS (STRING & BLOCK) ═══════════════════════════
 
@@ -705,16 +730,22 @@ def anotar_estado(estacion, lado, motivo, **campos):
         logger.debug(f"No se pudo anotar estado de {estacion}/{lado}: {e}")
 
 
-def registrar_history(cursor, pipeline, part_number_id, cantidad, fecha_fmt, tiempo, dato, log):
+def registrar_history(cursor, pipeline, part_number_id, cantidad, fecha_fmt, tiempo, dato, log,
+                      shop_order_number=None):
     """
     Inserta el detalle en histories con las columnas extra que decida el área.
 
     Estampado agrega `sequence` con el troquel; las demás áreas no agregan nada.
-    Antes esto vivía en una jerarquía DBStrategy paralela al pipeline de área;
-    ahora el área es una sola cosa (ver areas/).
+    `shop_order_number` va aparte porque no depende del área: es la orden a la
+    que se atribuyó lo registrado, y es lo que permite reconciliar el detalle
+    contra el plan. En la producción no planeada va nulo.
+
+    Ojo con la unidad de `cantidad`: son GOLPES en Estampado y PIEZAS en las
+    demás áreas. Es el incremento crudo del contador, sin multiplicar.
     """
     try:
         repo.insertar_history(cursor, part_number_id, cantidad, fecha_fmt, tiempo,
+                              shop_order_number=shop_order_number,
                               **pipeline.extras_history(dato or {}))
     except Exception as e:
         log.error(f"Error insert history: {e}")
@@ -728,6 +759,9 @@ class IPDataCollector:
         self.area = area
         # El pipeline del área se resuelve una vez, no en cada lectura.
         self._pipeline = obtener_pipeline(area)
+        # Última resolución con varias partes por lado, para no repetir el mismo
+        # renglón en el log en cada ciclo (ver _process_station_data).
+        self._ultima_division = {}
 
     def _parse_tag(self, tag_name):
         """Detecta tipo y lado del tag. La lógica vive en plc/decodificador.py"""
@@ -896,11 +930,19 @@ class IPDataCollector:
                 # contra AS400 y part_numbers, así que entra como validado.
                 validado_flag = None if self._pipeline.requiere_validacion_bd() else True
 
+                # Solo se registra cuando CAMBIA. Antes salía en cada ciclo:
+                # con un MDI de dos partes eso son 86,400 renglones idénticos al
+                # día por lado, ~10 MB que tapan lo que sí hay que ver.
+                clave_division = (estacion, grp)
                 if len(nombres_parte) > 1:
-                    log.info(
-                        f"🔀 {estacion}/{grp} [{self._pipeline.nombre}]: "
-                        f"'{raw}' -> {nombres_parte} (contador={data['contador']})"
-                    )
+                    if self._ultima_division.get(clave_division) != raw:
+                        self._ultima_division[clave_division] = raw
+                        log.info(
+                            f"🔀 {estacion}/{grp} [{self._pipeline.nombre}]: "
+                            f"'{raw}' -> {nombres_parte}"
+                        )
+                else:
+                    self._ultima_division.pop(clave_division, None)
 
                 for p_nombre in nombres_parte:
                     datos_estacion.append({
@@ -1058,116 +1100,57 @@ class IPDataProcessor:
         """Guarda el estado. La escritura atómica vive en persistence/estado.py"""
         estado_store.guardar_estado(self.state_file, self.active_records, self.ip)
 
-    def _ensure_active_record(self, cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, pipeline, contador_previo=None, lado='--'):
+    def _linea_base_de_corrida(self, cursor, estacion, num, cnt, pipeline, log,
+                               corridas_previas):
         """
-        Garantiza que exista un registro activo (Status 7) para la estación y parte.
-        Modelo incremental: la BD es la dueña del acumulado (produced_quantity);
-        aquí solo se fija la línea base del contador (contador_registro = cnt)
-        desde donde se calcularán los deltas. No se reconstruyen offsets ni
-        corridas: lo ya producido permanece intacto en BD.
-        - contador_previo: en cambio de turno, valor del contador al cierre del
-          turno anterior; el avance (cnt - contador_previo) es la producción
-          inicial del nuevo registro.
+        Desde qué valor del contador se empieza a contar una parte recién vista.
+
+        Sin estado previo, el contador del PLC admite dos lecturas y elegir mal
+        cuesta producción real:
+
+          - Ya había una orden EN PROGRESO: alguien venía contando y lo que
+            marca el contador ya está registrado. La base es el valor actual y
+            solo se registra lo que venga de aquí en adelante.
+          - No había ninguna: es una corrida nueva, y lo que marca el contador
+            es producción de esta corrida que todavía no está en ningún lado.
+
+        `corridas_previas` memoriza la respuesta POR CICLO y es imprescindible:
+        cuando LH y RH producen la misma parte, el primer lado en registrarse
+        deja la orden En progreso, y sin la memoria el segundo lado creería que
+        su contador ya estaba contado y tiraría su arranque a la basura.
+
+        Devuelve (linea_base, multiplicador).
         """
         leer_mult = lector_multiplicador(pipeline)
+        try:
+            mult = leer_mult(cursor, num, estacion, log) or 1
+        except Exception as e:
+            log.error(f"❌ No se pudo leer el multiplicador de {num} en {estacion}: {e}")
+            mult = 1
 
-        id_reg, q_plan, q_prod, status, prod_start_db, mult = obtener_id_registro_activo(
-            cursor, estacion, fecha_plan, turno, num, log, leer_mult
-        )
-
-        mult = mult or 1
-
-        # Casos de Retorno (Diccionario de estado)
-        reg_state = {
-            'id_registro': None,
-            'quantity_planeada': 0,
-            'multiplicador': mult,
-            'contador_registro': cnt,  # Línea base: los deltas se cuentan desde aquí
-            'hora_cambio': datetime.now().time().replace(microsecond=0),
-            'numero_original': num_orig,
-            'lado': lado,  # 🆕 Persistir el lado
-            'necesita_production_start': False,
-            'error_bd': None,  # 🆕 Para propagar el error de BD
-            'registro_creado': False,  # True solo si el registro se insertó en esta llamada
-            'delta_inicial': 0  # Golpes del primer tramo (solo aplica a registros creados)
-        }
-
-        # CASO 1: CREAR NUEVO
-        if id_reg is None:
-            if contador_previo is not None:
-                # Cambio de turno: la producción inicial es el avance desde el
-                # contador con que cerró el turno anterior.
-                delta_inicial, fue_negativo = calcular_delta_turno(contador_previo, cnt)
-                if fue_negativo:
-                    log.warning(
-                        f"⚠️ Cambio de turno con delta negativo detectado en {estacion}/{num}/{lado}: "
-                        f"cnt_actual={cnt}, contador_previo_turno={contador_previo}, mult={mult}. "
-                        f"Se fuerza qty_inicial=0 para evitar negativos en production_records."
-                    )
-                qty_inicial = piezas_producidas(delta_inicial, mult)
-
-                log.info(
-                    f"🕒 Nuevo registro por cambio de turno en {estacion}/{num}/{lado}: "
-                    f"cnt_actual={cnt}, contador_previo={contador_previo}, delta_inicial={delta_inicial}, "
-                    f"qty_inicial={qty_inicial}, turno={turno}"
-                )
-            else:
-                # Parte nueva: el contador actual del PLC pertenece a esta corrida.
-                if mult == 1:
-                    mult = leer_mult(cursor, num, estacion, log) or 1
-                delta_inicial = cnt
-                qty_inicial = piezas_producidas(cnt, mult)
-
-            id_reg, q_plan, q_prod, mult_new, error_bd = crear_nuevo_registro(
-                cursor, num, estacion, qty_inicial, turno, fecha_fmt, fecha_plan, num_orig, log,
-                leer_mult
-            )
-
-            if id_reg is None:
-                reg_state['error_bd'] = error_bd
-                return reg_state
-
-            reg_state.update({
-                'id_registro': id_reg,
-                'quantity_planeada': q_plan,
-                'multiplicador': mult_new or mult,
-                'necesita_production_start': False,  # ✅ Ya tiene start del INSERT
-                'registro_creado': True,
-                'delta_inicial': delta_inicial
-            })
-            return reg_state
-
-        # CASO 2: REACTIVAR (Status 8) — mismo registro, mismo acumulado.
-        # Lo producido antes sigue en BD; lo nuevo se sumará como delta a partir
-        # del contador actual del PLC (haya reset o no).
-        if status == 8:
+        if num in corridas_previas:
+            en_progreso = corridas_previas[num]
+        else:
             try:
-                repo.reactivar_registro(cursor, id_reg)
-                log.info(
-                    f"✅ Registro {id_reg} reactivado (status 8 → 7). "
-                    f"Acumulado BD preservado: {q_prod or 0}. Conteo continúa desde cnt={cnt}."
-                )
+                en_progreso = ordenes.hay_corrida_en_progreso(cursor, estacion, num)
             except Exception as e:
-                log.error(f"❌ Error reactivando registro {id_reg}: {e}")
+                # Ante la duda no se inventa producción: se cuenta desde aquí.
+                log.error(f"❌ No se pudo comprobar la corrida de {num} en {estacion}: {e}")
+                en_progreso = True
+            corridas_previas[num] = en_progreso
 
-            reg_state.update({
-                'id_registro': id_reg,
-                'quantity_planeada': q_plan,
-                'multiplicador': mult,
-                'necesita_production_start': False
-            })
-            return reg_state
+        if en_progreso:
+            log.info(
+                f"↩️ {estacion}/{num}: ya había una orden en progreso, "
+                f"se cuenta desde cnt={cnt} (mult={mult})."
+            )
+            return cnt, mult
 
-        # CASO 3: ACTIVO
-        if prod_start_db is None and status == 3:
-            reg_state['necesita_production_start'] = True
-
-        reg_state.update({
-            'id_registro': id_reg,
-            'quantity_planeada': q_plan,
-            'multiplicador': mult,
-        })
-        return reg_state
+        log.info(
+            f"▶️ {estacion}/{num}: corrida nueva, el contador trae {cnt} "
+            f"por registrar (mult={mult})."
+        )
+        return 0, mult
 
     async def process_continuously(self):
         if self.ip not in ip_data_queues: return
@@ -1220,6 +1203,15 @@ class IPDataProcessor:
             self.save_state()
 
     def _process_estacion(self, pkg):
+        """
+        Registra lo que produjo una estación desde la lectura anterior.
+
+        El modelo es LLENAR ÓRDENES: cada incremento del contador busca la orden
+        abierta más antigua de esa parte, la llena, y al completarse sigue con la
+        siguiente. El turno ya no parte los registros — una corrida que cruza el
+        cambio de turno sigue llenando la misma orden. El turno solo se guarda
+        como dato en el registro de producción no planeada.
+        """
         estacion = pkg['estacion']
         datos = pkg['datos']
         area = pkg.get('area', 'Default')
@@ -1228,84 +1220,74 @@ class IPDataProcessor:
 
         log = get_station_logger(estacion)
 
-        # ✅ Usar pool de conexiones
         conn = create_connection()
         if conn is None:
             log.error("❌ No se pudo obtener conexión a BD para procesar estación")
-            return
+            return False
 
         pipeline = obtener_pipeline(area)
-
         state_changed = False
 
         try:
             with conn.cursor() as cursor:
                 hora = now.time().replace(microsecond=0)
-
-                # Usar versión segura para obtener turno
                 turno, fecha_plan = safe_get_current_shift(hora)
-
-                # Registrar para diagnóstico (opcional)
-                if not SHIFTS_CONFIG:
-                    log.warning(f"⚠️ Usando valores por defecto para turnos en {estacion}")
-
                 fecha_fmt = now.strftime('%Y-%m-%d %H:%M:%S')
+                # Fecha fija de corte: no se tocan órdenes planeadas antes de ahí.
+                desde_fecha = ORDENES_DESDE
+                # Qué partes venían ya en corrida ANTES de este ciclo. Se resuelve
+                # una sola vez por parte para que los dos lados de la estación vean
+                # el mismo panorama (ver _linea_base_de_corrida).
+                corridas_previas = {}
 
                 if not datos:
                     if not plc_ok:
                         REGISTRO.anotar_estacion(estacion, obs_estado.LECTURA_PARCIAL)
-                        # Lectura incompleta/fallida: NO se puede concluir que la estación
-                        # dejó de producir. Se conserva el caché (línea base de contadores)
-                        # para que al reconectar el delta recupere lo producido en el hueco.
+                        # Lectura incompleta: NO se puede concluir que la estación dejó
+                        # de producir. Se conserva la línea base de contadores para que
+                        # al reconectar el delta recupere lo producido en el hueco.
                         log.warning(
                             f"⚠️ Lectura incompleta del PLC para {estacion}. "
                             f"Manteniendo estado en caché sin cambios."
                         )
-                        return
+                        return False
 
                     # Lectura buena y sin partes: la estación sí dejó de producir.
                     REGISTRO.anotar_estacion(estacion, obs_estado.ESTACION_SIN_PARTES)
-                    repo.cerrar_registros_de_estacion(cursor, estacion, fecha_plan, turno, fecha_fmt)
+                    ordenes.detener_estacion(cursor, estacion, fecha_fmt)
 
-                    keys_to_delete = [k for k in self.active_records if k.startswith(f"{estacion}_")]
-                    for k in keys_to_delete:
+                    for k in [k for k in self.active_records if k.startswith(f"{estacion}_")]:
                         del self.active_records[k]
                         state_changed = True
 
                     conn.commit()
                     return state_changed
 
-                claves_actuales_en_plc = set()
-                for d in datos:
-                    if d['parte']:  # Solo agregar si tiene parte válida
-                        # 🆕 CLAVE ÚNICA POR LADO: estacion_parte_lado
-                        lado = d.get('lado', '--')
-                        claves_actuales_en_plc.add(f"{estacion}_{d['parte']}_{lado}")
+                claves_actuales_en_plc = {
+                    f"{estacion}_{d['parte']}_{d.get('lado', '--')}"
+                    for d in datos if d['parte']
+                }
 
-                # Cierre por ausencia SOLO con lectura completa: en una lectura parcial
-                # (p.ej. falló el bloque de un lado) la ausencia de una parte no significa
-                # que dejó de producirse, y cerrarla borraría su línea base de contador.
+                # Fin de corrida por ausencia, SOLO con lectura completa: en una lectura
+                # parcial (falló el bloque de un lado) la ausencia de una parte no
+                # significa que dejó de producirse, y borrarla perdería su línea base.
                 if plc_ok:
-                    claves_obsoletas = []
-                    for k in self.active_records:
-                        # 🆕 Verificar prefijo y ausencia en claves actuales
-                        if k.startswith(f"{estacion}_") and k not in claves_actuales_en_plc:
-                            claves_obsoletas.append(k)
-
-                    for k in claves_obsoletas:
-                        record_id = self.active_records[k].get('id_registro')
-                        if record_id:
-                             try:
-                                repo.cerrar_registro(cursor, record_id, fecha_fmt)
-                             except Exception as e:
-                                log.error(f"Error cerrando registro obsoleto {record_id}: {e}")
-
+                    obsoletas = [k for k in self.active_records
+                                 if k.startswith(f"{estacion}_") and k not in claves_actuales_en_plc]
+                    for k in obsoletas:
+                        abierta = self.active_records[k].get('id_en_curso')
+                        if abierta:
+                            try:
+                                ordenes.detener(cursor, abierta, fecha_fmt)
+                                log.info(f"⏹️ Corrida terminada en {k}: orden {abierta} Detenida.")
+                            except Exception as e:
+                                log.error(f"Error deteniendo la orden {abierta}: {e}")
                         del self.active_records[k]
                         state_changed = True
                 else:
                     log.warning(
-                        f"⚠️ Lectura parcial del PLC en {estacion}: se omite el cierre de "
-                        f"registros ausentes para no perder su contador base."
+                        f"⚠️ Lectura parcial del PLC en {estacion}: se omite el fin de "
+                        f"corrida de las partes ausentes para no perder su contador base."
                     )
 
                 for d in datos:
@@ -1314,282 +1296,173 @@ class IPDataProcessor:
                     cnt = d['contador']
                     tiempo = d['tiempo']
                     troquel_id = d.get('troquel_id')
-                    
                     lado_actual = d.get('lado', '--')
+
                     cache_key = f"{estacion}_{num_orig}_{num}_{lado_actual}"
                     current_state = {"parte_original": num_orig, "contador": cnt}
-                    previous_state = self.last_scanned_parts.get(cache_key)
 
-                    # 🚀 OPTIMIZACIÓN DE POLLEO: Si la pieza y contador son idénticos al milisegundo anterior, saltamos validación SQL
-                    if previous_state and previous_state["parte_original"] == num_orig and previous_state["contador"] == cnt:
-                        # El contador está congelado, pero si ya cruzamos la frontera de
-                        # turno hay que CERRAR el registro del turno anterior: de lo
-                        # contrario se queda abierto indefinidamente en el turno que ya pasó.
-                        # El registro del turno nuevo NO se crea aquí a propósito: nacerá
-                        # cuando haya producción real, porque hora_cambio no se actualiza
-                        # y el bloque de cambio de turno volverá a dispararse entonces.
-                        _reg_frio = self.active_records.get(f"{estacion}_{num}_{lado_actual}")
-                        if (_reg_frio and _reg_frio.get('id_registro')
-                                and not _reg_frio.get('cerrado_por_turno')
-                                and has_shift_changed(_reg_frio['hora_cambio'], hora)):
-                            try:
-                                repo.cerrar_registro(cursor, _reg_frio['id_registro'], fecha_fmt)
-                                _reg_frio['cerrado_por_turno'] = True
-                                conn.commit()
-                                state_changed = True
-                                log.info(
-                                    f"🕒 Registro {_reg_frio['id_registro']} cerrado en el cambio de turno "
-                                    f"({estacion}/{num}/{lado_actual}) con el contador detenido en {cnt}. "
-                                    f"El registro del turno nuevo se creará cuando haya producción."
-                                )
-                            except Exception as e:
-                                log.error(f"Error cerrando registro por turno con contador detenido: {e}")
-                        # El contador no avanza, pero la estación SIGUE viva: hay que
-                        # dejar constancia o desaparecería del tablero justo cuando
-                        # está parada, que es cuando más se la busca.
-                        if d.get('parte'):
+                    # 🚀 Contador congelado desde la lectura anterior: no hay nada que
+                    # registrar, pero la estación SIGUE viva y hay que dejar constancia
+                    # o desaparecería del tablero justo cuando está parada.
+                    if self.last_scanned_parts.get(cache_key) == current_state:
+                        if num:
                             anotar_estado(estacion, lado_actual, obs_estado.CONTADOR_DETENIDO,
                                           area=area, ip=self.ip, numero_plc=num_orig,
                                           numero_validado=num, contador=cnt)
-                        continue  # evitamos saturar SQL Server con trabajo que no cambia nada
+                        continue
 
-                    # Si es nuevo o ha cambiado, actualizamos nuestro caché antes del procesamiento pesado
                     self.last_scanned_parts[cache_key] = current_state
-                    validado = d.get('validado')
-                    error_val = d.get('error_validacion', None)
 
-                    if validado is False:
-                        log.warning(f"⚠️ Número de parte NO VALIDADO (previamente): {num_orig} - Error: {error_val}")
-
+                    if d.get('validado') is False:
+                        error_val = d.get('error_validacion')
+                        log.warning(f"⚠️ Número de parte NO VALIDADO: {num_orig} - Error: {error_val}")
                         anotar_estado(estacion, lado_actual, motivo_de_error(error_val),
                                       area=area, ip=self.ip, numero_plc=num_orig,
                                       contador=cnt, detalle=error_val)
-
-                        #  CRÍTICO: Registrar en CSV ANTES de hacer continue
                         if error_val:
-                            log.info(f"📝 Registrando error en CSV: estacion={estacion}, num_orig={num_orig}, error={error_val}")
-                            registrar_error_validacion(estacion, num_orig, error_val)
-                            
-                        # El UI ya fue actualizado a ❌ en collect_and_enqueue por Estampado
-
+                            registrar_error_validacion(estacion, num_orig, error_val,
+                                                       lado=lado_actual, area=area)
                         continue
 
-                    clave = f"{estacion}_{num}_{d.get('lado', '--')}"  # 🆕 CLAVE POR LADO
+                    clave = f"{estacion}_{num}_{lado_actual}"
+                    reg = self.active_records.get(clave)
 
-                    if clave not in self.active_records:
-                        new_record = self._ensure_active_record(cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, pipeline, lado=d.get('lado', '--'))
-                        
-                        if new_record and new_record.get('error_bd'):
-                            error_bd = new_record['error_bd']
-                            log.warning(f"⚠️ Número de parte RECHAZADO EN BD: {num_orig} - Error: {error_bd}")
-                            registrar_error_validacion(estacion, num_orig, error_bd,
-                                                       lado=d.get('lado', '--'), area=area)
-                            anotar_estado(estacion, d.get('lado', '--'), motivo_de_error(error_bd),
-                                          area=area, ip=self.ip, numero_plc=num_orig,
-                                          numero_validado=num, contador=cnt, detalle=error_bd)
-                            
-                            continue
-                        
-                        if not new_record or new_record.get('id_registro') is None:
-                             continue
-
-                        # History inicial: SOLO cuando el registro se CREÓ en esta pasada.
-                        # El primer tramo (0 → cnt) nunca llega al bloque "if cnt != prev"
-                        # porque contador_registro se inicializa igual a cnt.
-                        # En recuperaciones/reactivaciones NO se inserta nada: esos golpes
-                        # ya están en histories y volver a insertarlos los duplicaría.
-                        if new_record.get('registro_creado'):
-                            _delta_inicial = new_record.get('delta_inicial', 0)
-                            if _delta_inicial > 0:
-                                pid_nuevo = obtener_part_number_id(cursor, num, estacion)
-                                if pid_nuevo:
-                                    extras_ini = {'troquel_id': troquel_id}
-                                    try:
-                                        registrar_history(
-                                            cursor, pipeline, pid_nuevo, _delta_inicial,
-                                            fecha_fmt, d.get('tiempo', 0.0), extras_ini, log
-                                        )
-                                        log.info(
-                                            f"📝 History inicial registrado al crear nuevo registro {num}: "
-                                            f"delta={_delta_inicial}, turno={turno}"
-                                        )
-                                    except Exception as _e_h:
-                                        log.error(f"❌ Error insertando history inicial para {num}: {_e_h}")
-
-                        # Si llegamos aquí, el registro se creó bien, la parte SÍ es válida en DB
-                             
-                        self.active_records[clave] = new_record
+                    if reg is None:
+                        base, mult = self._linea_base_de_corrida(
+                            cursor, estacion, num, cnt, pipeline, log, corridas_previas)
+                        reg = {
+                            'contador_registro': base,
+                            'multiplicador': mult,
+                            'numero_original': num_orig,
+                            'lado': lado_actual,
+                            'id_en_curso': None,
+                        }
+                        self.active_records[clave] = reg
                         state_changed = True
 
-                    reg = self.active_records[clave]
-                    if reg['id_registro'] is None:
-                        continue
+                    prev = reg.get('contador_registro', cnt)
 
-                    #  CAMBIO: Detectar cambio de turno usando hora_cambio
-                    cambio_turno = has_shift_changed(reg["hora_cambio"], hora)
-
-                    if cambio_turno:
-                        old_id = reg['id_registro']
-                        prev_counter = reg.get('contador_registro', cnt)
-
-                        log.warning(
-                            f"🕒 Cambio de turno detectado en {estacion}/{num}/{d.get('lado', '--')}: "
-                            f"hora_anterior={reg.get('hora_cambio')}, hora_actual={hora}, "
-                            f"contador_previo={prev_counter}, contador_actual={cnt}, old_id={old_id}"
-                        )
-
-                        try:
-                            repo.cerrar_registro(cursor, old_id, fecha_fmt)
-                            log.info(f"✅ Registro anterior cerrado por cambio de turno: id={old_id}, production_end={fecha_fmt}")
-                        except Exception as e:
-                            log.error(f"Error cerrando registro {old_id}: {e}")
-
-                        # Recalcular turno
-                        if not SHIFTS_CONFIG:
-                            if time(8, 0) <= hora < time(20, 0): turno = 1
-                            elif hora >= time(20, 0): turno = 2
-                            else: turno = 2
-                        else:
-                            turno, _ = safe_get_current_shift(hora)
-
-                        log.info(
-                            f"🔄 Preparando nuevo registro por turno para {estacion}/{num}/{d.get('lado', '--')}: "
-                            f"turno_nuevo={turno}, fecha_plan={fecha_plan}, contador_previo={prev_counter}, cnt_actual={cnt}"
-                        )
-
-                        # Crear/obtener el registro del NUEVO turno.
-                        new_reg_data = self._ensure_active_record(
-                            cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt,
-                            pipeline, contador_previo=prev_counter,
-                            lado=d.get('lado', '--')
-                        )
-
-                        if new_reg_data and new_reg_data.get('id_registro'):
-                            reg.update(new_reg_data)
-                            # Ya hay registro del turno nuevo: se limpia la marca de
-                            # "cerrado con el contador detenido" para el siguiente turno.
-                            reg.pop('cerrado_por_turno', None)
-                            log.info(
-                                f"✅ Nuevo estado tras cambio de turno en {estacion}/{num}/{d.get('lado', '--')}: "
-                                f"nuevo_id={reg.get('id_registro')}, "
-                                f"contador_registro={reg.get('contador_registro')}"
-                            )
-
-                            # Avance de este lado desde el cierre del turno anterior.
-                            # Si el registro se creó en esta llamada, qty_inicial ya lo
-                            # incluye; si ya existía (p.ej. lo creó el otro lado o se
-                            # reactivó), se suma como delta para no perderlo ni duplicar.
-                            delta_turno = max(cnt - prev_counter, 0)
-                            if delta_turno > 0:
-                                if not new_reg_data.get('registro_creado'):
-                                    _necesita_start_ct = reg.get('necesita_production_start', False)
-                                    actualizar_registro(
-                                        cursor,
-                                        delta_turno * reg.get('multiplicador', 1),
-                                        fecha_fmt,
-                                        reg['id_registro'],
-                                        7,
-                                        log,
-                                        necesita_start=_necesita_start_ct
-                                    )
-                                    if _necesita_start_ct:
-                                        reg['necesita_production_start'] = False
-
-                                _pid_ct = obtener_part_number_id(cursor, num, estacion)
-                                if _pid_ct:
-                                    _extras_ct = {'troquel_id': troquel_id}
-                                    try:
-                                        registrar_history(
-                                            cursor, pipeline, _pid_ct, delta_turno,
-                                            fecha_fmt, d.get('tiempo', 0.0), _extras_ct, log
-                                        )
-                                        log.info(
-                                            f"📝 History cambio de turno: {num} "
-                                            f"delta={delta_turno}, turno={turno}"
-                                        )
-                                    except Exception as _eh_ct:
-                                        log.error(f"❌ Error history cambio turno {num}: {_eh_ct}")
-                            state_changed = True
-                        else:
-                            # No se pudo crear/obtener el registro del turno nuevo.
-                            # NO se toca 'reg': conserva el id del turno anterior (ya
-                            # cerrado) y escribir ahí reabriría el turno equivocado.
-                            # Se omite esta parte en este ciclo; como hora_cambio no se
-                            # actualiza, el cambio de turno se reintenta en la siguiente
-                            # lectura sin perder el contador base.
-                            log.error(
-                                f"❌ No se pudo abrir registro del turno {turno} para "
-                                f"{estacion}/{num}/{d.get('lado', '--')}: se reintentará "
-                                f"en la siguiente lectura (contador base={prev_counter} preservado)."
-                            )
-                            continue
-
-                    prev = reg.get("contador_registro", cnt)
-
-                    if cnt != prev:
-                        multiplicador = reg.get("multiplicador", 1)
-
-                        # 🔍 DIAGNÓSTICO: Log de cambio de contador
-                        log.debug(f"📊 Cambio contador en {num}: {prev} → {cnt}")
-
-                        # MODELO INCREMENTAL: solo se calcula el delta de golpes desde
-                        # la última lectura; la BD acumula (produced_quantity += delta).
-                        incremento_ciclo, hubo_reset = calcular_incremento(prev, cnt)
-                        if hubo_reset:
-                            log.warning(
-                                f"⚠️ Reset detectado en {num}: {prev} -> {cnt}. "
-                                f"Acumulado en BD intacto; se suma el contador nuevo como delta."
-                            )
-
-                        delta_produccion = piezas_producidas(incremento_ciclo, multiplicador)
-
-                        necesita_start = reg.get('necesita_production_start', False)
-
-                        actualizar_registro(
-                            cursor,
-                            delta_produccion,
-                            fecha_fmt,
-                            reg['id_registro'],
-                            7,
-                            log,
-                            necesita_start=necesita_start
-                        )
-
-                        pid = obtener_part_number_id(cursor, num, estacion)
-                        if pid:
-                            extras = {'troquel_id': troquel_id}
-                            # En histories se guarda el incremento de golpes sin multiplicar
-                            # (mismo comportamiento para estampado y área general)
-                            if incremento_ciclo > 0:
-                                registrar_history(cursor, pipeline, pid, incremento_ciclo,
-                                                  fecha_fmt, tiempo, extras, log)
-
-                        if necesita_start:
-                            reg['necesita_production_start'] = False
-
-                        reg['contador_registro'] = cnt
-                        reg['hora_cambio'] = hora
-                        state_changed = True
-
-                        _lado = d.get('lado', '--')
-                        anotar_estado(estacion, _lado, obs_estado.PRODUCIENDO,
+                    if cnt == prev:
+                        # La prensa está parada; no es una falla.
+                        anotar_estado(estacion, lado_actual, obs_estado.CONTADOR_DETENIDO,
                                       area=area, ip=self.ip, numero_plc=num_orig,
                                       numero_validado=num, contador=cnt)
+                        continue
+
+                    incremento, hubo_reset = calcular_incremento(prev, cnt)
+
+                    if hubo_reset:
+                        # El contador volvió a empezar: la corrida anterior terminó.
+                        # La orden que quedó a medias se marca Detenida. Si la producción
+                        # continúa, el siguiente incremento la retoma donde se quedó:
+                        # nada de lo ya registrado se pierde ni se duplica.
+                        log.warning(
+                            f"⚠️ Reset de contador en {estacion}/{num}/{lado_actual}: "
+                            f"{prev} → {cnt}. Fin de corrida; lo registrado queda intacto."
+                        )
+                        abierta = reg.get('id_en_curso')
+                        if abierta:
+                            try:
+                                ordenes.detener(cursor, abierta, fecha_fmt)
+                            except Exception as e:
+                                log.error(f"Error deteniendo la orden {abierta}: {e}")
+                            reg['id_en_curso'] = None
                         try:
-                            obs_metricas.plc_contador.labels(estacion, _lado).set(cnt)
-                            obs_metricas.produccion_piezas.labels(estacion, _lado, str(area)).inc(delta_produccion)
-                            obs_metricas.produccion_golpes.labels(estacion, _lado, str(area)).inc(incremento_ciclo)
-                            if tiempo:
-                                obs_metricas.plc_tiempo_ciclo.labels(estacion, _lado).set(tiempo)
-                            if hubo_reset:
-                                obs_metricas.resets_contador.labels(estacion, _lado).inc()
+                            obs_metricas.resets_contador.labels(estacion, lado_actual).inc()
                         except Exception:
                             pass
-                    else:
-                        # El contador no avanzó: la prensa está parada, no es una falla.
-                        anotar_estado(estacion, d.get('lado', '--'), obs_estado.CONTADOR_DETENIDO,
+
+                    if incremento <= 0:
+                        reg['contador_registro'] = cnt
+                        state_changed = True
+                        continue
+
+                    multiplicador = reg.get('multiplicador', 1) or 1
+                    if pipeline.usa_multiplicador:
+                        # Solo Estampado. pieces_per_shot puede corregirse en
+                        # caliente y releerlo cuesta una consulta pequeña; el
+                        # precio de no hacerlo es registrar toda una corrida con
+                        # un multiplicador viejo, que después nadie cuadra.
+                        leido = lector_multiplicador(pipeline)(cursor, num, estacion, log) or 1
+                        if leido != multiplicador:
+                            log.info(
+                                f"🔧 {estacion}/{num}: piezas por golpe {multiplicador} → {leido}"
+                            )
+                            reg['multiplicador'] = leido
+                            state_changed = True
+                        multiplicador = leido
+
+                    # El id de la parte no cambia mientras dure la corrida, así que
+                    # se resuelve una vez y se guarda con la línea base. Consultarlo
+                    # en cada incremento costaba lo mismo que buscar las órdenes,
+                    # para devolver siempre el mismo número.
+                    part_number_id = reg.get('part_number_id')
+                    if not part_number_id:
+                        part_number_id = obtener_part_number_id(cursor, num, estacion)
+                        if part_number_id:
+                            reg['part_number_id'] = part_number_id
+                            state_changed = True
+
+                    def anotar_historial(id_registro, orden_num, cantidad,
+                                         _pid=part_number_id, _troquel=troquel_id, _t=tiempo):
+                        """
+                        Una fila de histories por lo que se atribuyó a esa orden.
+
+                        `cantidad` va en la unidad del contador del área: golpes
+                        en Estampado, piezas en las demás.
+                        """
+                        if not _pid:
+                            return
+                        registrar_history(cursor, pipeline, _pid, cantidad, fecha_fmt, _t,
+                                          {'troquel_id': _troquel}, log,
+                                          shop_order_number=orden_num)
+
+                    resultado = ordenes.registrar_incremento(
+                        cursor, estacion, num, incremento, multiplicador,
+                        desde_fecha=desde_fecha, fecha_plan=fecha_plan, turno=turno,
+                        fecha_fmt=fecha_fmt, anotar_history=anotar_historial, log=log,
+                    )
+
+                    if resultado.error:
+                        # No hubo dónde registrar. La línea base NO se mueve: el próximo
+                        # ciclo reintenta con el delta completo en vez de perderlo.
+                        log.warning(f"⚠️ Número de parte RECHAZADO EN BD: {num_orig} - {resultado.error}")
+                        registrar_error_validacion(estacion, num_orig, resultado.error,
+                                                   lado=lado_actual, area=area)
+                        anotar_estado(estacion, lado_actual, motivo_de_error(resultado.error),
                                       area=area, ip=self.ip, numero_plc=num_orig,
-                                      numero_validado=num, contador=cnt)
+                                      numero_validado=num, contador=cnt, detalle=resultado.error)
+                        continue
+
+                    reg['contador_registro'] = cnt
+                    reg['id_en_curso'] = resultado.en_curso
+                    state_changed = True
+
+                    if resultado.cerradas:
+                        log.info(
+                            f"🏁 {estacion}/{num}/{lado_actual} completó "
+                            f"{len(resultado.cerradas)} orden(es): {', '.join(resultado.cerradas)}"
+                        )
+
+                    anotar_estado(estacion, lado_actual, obs_estado.PRODUCIENDO,
+                                  area=area, ip=self.ip, numero_plc=num_orig,
+                                  numero_validado=num, contador=cnt)
+                    try:
+                        obs_metricas.plc_contador.labels(estacion, lado_actual).set(cnt)
+                        obs_metricas.produccion_piezas.labels(
+                            estacion, lado_actual, str(area)).inc(resultado.piezas)
+                        obs_metricas.produccion_conteo.labels(
+                            estacion, lado_actual, str(area)).inc(resultado.incremento)
+                        if resultado.cerradas:
+                            obs_metricas.ordenes_completadas.labels(
+                                estacion, str(area)).inc(len(resultado.cerradas))
+                        if resultado.no_planeado:
+                            obs_metricas.produccion_no_planeada.labels(
+                                estacion, lado_actual, str(area)).inc(resultado.no_planeado)
+                        if tiempo:
+                            obs_metricas.plc_tiempo_ciclo.labels(estacion, lado_actual).set(tiempo)
+                    except Exception:
+                        pass
 
                 conn.commit()
                 return state_changed

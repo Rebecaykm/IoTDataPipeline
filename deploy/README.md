@@ -193,10 +193,35 @@ línea `provisioning` del `custom.ini`, que el propio script te imprime.
 
 ### Para que arranquen solos
 
-En el servidor conviene registrarlos como servicios de Windows con
-[NSSM](https://nssm.cc/) (también portable, sin instalador):
+Ocultar la ventana **no basta**: un proceso lanzado desde una sesión muere
+cuando esa sesión se cierra. Como servicio arranca con el servidor, sobrevive al
+cierre de sesión y NSSM lo relanza si se cae.
 
-Usa las rutas que imprime `iniciar-observabilidad.ps1` (las de `.generado`):
+Primero, NSSM (portable, sin instalador): bajar de <https://nssm.cc/download> y
+descomprimir `win64\nssm.exe` en `C:\iot\obs\nssm\`.
+
+**El recolector** tiene su propio script, porque la ruta del entorno de Python
+cambia en cada máquina y escribirla a mano se presta a errores:
+
+```powershell
+cd <ruta-del-proyecto>\deploy
+.\servicio-recolector.ps1 estado       # ver cómo está (no pide administrador)
+.\servicio-recolector.ps1 instalar     # como Administrador
+.\servicio-recolector.ps1 reiniciar    # después de cada despliegue
+.\servicio-recolector.ps1 quitar
+```
+
+Resuelve el Python del entorno con `poetry env info`, avisa si hay un recolector
+suelto corriendo —que junto con el servicio contaría la producción doble— y deja
+el servicio en arranque automático con reinicio si se cae.
+
+> Si el entorno de Poetry vive dentro del perfil del usuario, el servicio corre
+> como LocalSystem y puede no tener acceso. Lo más robusto es dejarlo junto al
+> código: `poetry config virtualenvs.in-project true` y `poetry install`. El
+> script te lo avisa si detecta ese caso.
+
+**Los otros tres** se registran directo, con las rutas de `.generado` que imprime
+`iniciar-observabilidad.ps1`:
 
 ```powershell
 $nssm = "C:\iot\obs\nssm\nssm.exe"
@@ -209,18 +234,10 @@ $gen  = "<ruta-del-proyecto>\deploy\.generado"
 
 & $nssm install IoT-Alloy C:\iot\obs\alloy\alloy-windows-amd64.exe `
     "run $gen\alloy.alloy --storage.path=C:\iot\obs\datos\alloy"
-
-& $nssm install IoT-Recolector `
-    "C:\Users\<usuario>\AppData\Local\pypoetry\Cache\virtualenvs\<venv>\Scripts\python.exe" `
-    "<ruta-del-proyecto>\Prensas.py"
-& $nssm set IoT-Recolector AppDirectory "<ruta-del-proyecto>"
 ```
 
 Como los servicios no ejecutan el script de arranque, hay que correrlo **una
 vez** antes de registrarlos para que `.generado` exista.
-
-El recolector como servicio es lo que resuelve el problema de fondo: hoy, si
-alguien cierra la sesión de Windows, deja de contarse producción.
 
 ---
 
