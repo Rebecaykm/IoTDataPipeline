@@ -139,8 +139,11 @@ if ($Detener) {
 ""
 
 # ── Verificar los ejecutables ──────────────────────────────────────────────
+# Solo bloquea el ARRANQUE. Generar la configuración no depende de los binarios,
+# y si faltara uno y aquí se cortara, .generado quedaría a medias: Grafana
+# encontraría la carpeta de tableros vacía y borraría los que ya tenía.
 $faltan = $procesos | Where-Object { -not (Test-Path $_.Exe) }
-if ($faltan) {
+if ($faltan -and -not $SoloGenerar) {
     Write-Host "Faltan ejecutables:" -ForegroundColor Red
     $faltan | ForEach-Object { Write-Host "  no existe: $($_.Exe)" -ForegroundColor Red }
     Write-Host ""
@@ -162,8 +165,12 @@ function Resolver($origen, $destino) {
     # __APP_UNIX__ lleva diagonales normales: el archivo de Alloy usa cadenas
     # estilo Go, donde la diagonal invertida es un escape y "C:\Users\..."
     # rompe el parseo. Windows acepta ambas para rutas de archivo.
+    # Leer con UTF-8 EXPLICITO. Get-Content -Raw en Windows PowerShell 5.1 —el
+    # que trae el servidor— decodifica como ANSI cuando el archivo no lleva BOM,
+    # y los acentos se rompen: "producción" sale como "producciÃ³n" en el
+    # tablero. Aquí no se nota porque PowerShell 7 ya asume UTF-8.
     $appUnix = $APP.Replace('\', '/')
-    $texto = (Get-Content $origen -Raw).
+    $texto = [System.IO.File]::ReadAllText($origen, [System.Text.Encoding]::UTF8).
         Replace('__APP_UNIX__', $appUnix).
         Replace('__APP__', $APP).
         Replace('__OBS__', $OBS).
@@ -194,6 +201,69 @@ Get-ChildItem (Join-Path $DEPLOY "grafana\dashboards") -Filter *.json | ForEach-
     Resolver $_.FullName (Join-Path $GEN "dashboards\$($_.Name)")
 }
 "  configuracion generada en $GEN"
+
+# ── El custom.ini de Grafana ───────────────────────────────────────────────
+# Este era el unico paso manual que quedaba, y el mas facil de equivocar: la
+# ruta tiene que terminar en \provisioning. Si apunta un nivel arriba, Grafana
+# NO da error: busca los .yml donde no estan, provisiona cero cosas en medio
+# milisegundo y —con disableDeletion en false— borra los tableros que ya tenia.
+# Queda la carpeta vacia y ni una linea en el log que lo explique.
+function AsegurarCustomIni {
+    $ini      = Join-Path $OBS "grafana\conf\custom.ini"
+    $correcta = Join-Path $GEN "provisioning"
+
+    if (-not (Test-Path $ini)) {
+        $contenido = @(
+            "[paths]",
+            "provisioning = $correcta",
+            "",
+            "[users]",
+            "default_theme = dark",
+            "",
+            "[analytics]",
+            "reporting_enabled = false",
+            "check_for_updates = false"
+        ) -join "`r`n"
+        New-Item -ItemType Directory -Force (Split-Path $ini) | Out-Null
+        [System.IO.File]::WriteAllText($ini, $contenido, (New-Object System.Text.UTF8Encoding($false)))
+        "  custom.ini creado con la ruta de provision"
+        return
+    }
+
+    # UTF-8 explícito, por lo mismo que en Resolver: en PowerShell 5.1,
+    # Get-Content sin -Encoding rompe los acentos de lo que ya estuviera aquí.
+    $lineas = @([System.IO.File]::ReadAllLines($ini, [System.Text.Encoding]::UTF8))
+    $actual = ($lineas | Where-Object { $_ -match '^\s*provisioning\s*=' } | Select-Object -First 1)
+
+    if ($actual -and $actual.Trim() -eq "provisioning = $correcta") {
+        "  custom.ini ya apunta a la provision correcta"
+        return
+    }
+
+    if ($actual) {
+        $nuevas = $lineas | ForEach-Object {
+            if ($_ -match '^\s*provisioning\s*=') { "provisioning = $correcta" } else { $_ }
+        }
+        "  custom.ini corregido:"
+        "     antes:   $($actual.Trim())"
+        "     ahora:   provisioning = $correcta"
+    } elseif ($lineas -match '^\s*\[paths\]') {
+        $nuevas = @()
+        foreach ($l in $lineas) {
+            $nuevas += $l
+            if ($l -match '^\s*\[paths\]') { $nuevas += "provisioning = $correcta" }
+        }
+        "  custom.ini: se agrego la ruta de provision a [paths]"
+    } else {
+        $nuevas = @("[paths]", "provisioning = $correcta", "") + $lineas
+        "  custom.ini: se agrego la seccion [paths] con la ruta de provision"
+    }
+
+    [System.IO.File]::WriteAllText($ini, ($nuevas -join "`r`n"),
+                                   (New-Object System.Text.UTF8Encoding($false)))
+}
+
+AsegurarCustomIni
 
 # ── Carpetas de datos (fuera del repositorio) ──────────────────────────────
 foreach ($sub in @("datos", "datos\loki", "datos\prometheus", "datos\alloy", "logs")) {

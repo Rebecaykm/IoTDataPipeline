@@ -159,22 +159,15 @@ C:\iot\obs\grafana\bin\grafana.exe cli --homepath C:\iot\obs\grafana `
 > Desde Grafana 10 ya **no existe `grafana-cli.exe`**: el CLI viene dentro del
 > mismo binario, por eso es `grafana.exe cli`.
 
-**b) Crear `C:\iot\obs\grafana\conf\custom.ini`.** La ruta de provisión depende
-de dónde tengas el proyecto, y el script te la imprime al arrancar:
+**b) El `custom.ini` se arregla solo.** `iniciar-observabilidad.ps1` lo crea si
+no existe y corrige la línea `provisioning` si apunta a otro lado, conservando lo
+demás (contraseña, tema). No hay que editarlo a mano.
 
-```ini
-[paths]
-provisioning = <ruta-del-proyecto>\deploy\.generado\provisioning
-
-[users]
-default_theme = dark
-
-[security]
-admin_password = admin
-```
-
-Corre una vez `.\iniciar-observabilidad.ps1` y copia la ruta exacta que aparece
-al final. Después reinicia Grafana.
+> Esa línea **tiene que terminar en `\provisioning`**. Si apunta un nivel
+> arriba, Grafana **no da error**: busca los `.yml` donde no están, provisiona
+> cero cosas en medio milisegundo y —con `disableDeletion: false`— borra los
+> tableros que ya tenía. Queda la carpeta "IoT Planta" vacía y ni una línea en
+> el log que lo explique. Por eso el script lo verifica en cada arranque.
 
 ---
 

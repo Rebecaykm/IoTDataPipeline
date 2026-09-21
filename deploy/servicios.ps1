@@ -285,6 +285,15 @@ if (-not (Test-Path $Nssm)) {
 if ($Que -in @("todos", "observabilidad")) {
     "Generando la configuracion con las rutas y puertos de esta maquina..."
     & (Join-Path $DEPLOY "iniciar-observabilidad.ps1") -SoloGenerar -Obs $OBS | Out-Null
+
+    # Si esto fallara en silencio, Grafana encontraria la carpeta de tableros
+    # vacia y borraria los que ya tenia: quedaria "IoT Planta" sin nada dentro.
+    $tableros = @(Get-ChildItem (Join-Path $GEN "dashboards") -Filter *.json -ErrorAction SilentlyContinue)
+    if ($tableros.Count -eq 0) {
+        throw ("No se genero ningun tablero en $GEN\dashboards. " +
+               "Corre '.\iniciar-observabilidad.ps1 -SoloGenerar' a ver que dice.")
+    }
+    "  $($tableros.Count) tableros listos en $GEN\dashboards"
 }
 
 ""
