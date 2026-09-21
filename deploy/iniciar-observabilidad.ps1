@@ -17,15 +17,16 @@ param(
     [switch]$Detener,
     [switch]$SinRecolector,   # levantar solo la observabilidad
     [switch]$Visible,         # con ventanas, para diagnosticar
+    [switch]$SoloGenerar,     # escribir .generado y salir, sin arrancar nada
     [string]$Obs = $env:IOT_OBS,
 
-    # Los puertos se escriben en UN solo lugar: de aquí bajan a las plantillas,
-    # a las fuentes de datos de Grafana y a los enlaces de los tableros.
-    [int]$PuertoGrafana    = 3000,
-    [int]$PuertoPrometheus = 9090,
-    [int]$PuertoLoki       = 3100,
-    [int]$PuertoAlloy      = 12345,
-    [int]$PuertoRecolector = 0     # 0 = tomarlo del .env (HTTP_PORT)
+    # Los puertos viven en el .env (ver deploy\puertos.ps1). Estos parámetros
+    # solo sirven para una prueba puntual sin tocar el archivo; 0 = usar el .env.
+    [int]$PuertoGrafana    = 0,
+    [int]$PuertoPrometheus = 0,
+    [int]$PuertoLoki       = 0,
+    [int]$PuertoAlloy      = 0,
+    [int]$PuertoRecolector = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,21 +38,18 @@ $OBS = $Obs.TrimEnd('\')
 $GEN  = Join-Path $DEPLOY ".generado"
 $LOGS = Join-Path $OBS "logs"
 
-# El recolector lee HTTP_PORT del .env. Si aquí se pusiera otro número,
-# Prometheus raspa un puerto donde no hay nadie y los tableros salen vacíos sin
-# decir por qué. Por eso se lee del mismo lugar en vez de repetirlo.
-if ($PuertoRecolector -eq 0) {
-    $PuertoRecolector = 9100
-    $archivoEnv = Join-Path $APP ".env"
-    if (Test-Path $archivoEnv) {
-        $linea = Get-Content $archivoEnv |
-                 Where-Object { $_ -match '^\s*HTTP_PORT\s*=\s*(\d+)' } |
-                 Select-Object -Last 1
-        if ($linea -match '^\s*HTTP_PORT\s*=\s*(\d+)') {
-            $PuertoRecolector = [int]$Matches[1]
-        }
-    }
-}
+# Todos los puertos salen del .env. Un parámetro solo los pisa para una prueba
+# puntual. Si se escribieran aquí, tarde o temprano quedarían distintos de los
+# del recolector y Prometheus raspara un puerto donde no hay nadie: los tableros
+# saldrían vacíos sin decir por qué.
+. (Join-Path $PSScriptRoot "puertos.ps1")
+$puertos = PuertosDelProyecto $APP
+
+if ($PuertoGrafana    -eq 0) { $PuertoGrafana    = $puertos.Grafana }
+if ($PuertoPrometheus -eq 0) { $PuertoPrometheus = $puertos.Prometheus }
+if ($PuertoLoki       -eq 0) { $PuertoLoki       = $puertos.Loki }
+if ($PuertoAlloy      -eq 0) { $PuertoAlloy      = $puertos.Alloy }
+if ($PuertoRecolector -eq 0) { $PuertoRecolector = $puertos.Recolector }
 
 $PUERTOS = @($PuertoGrafana, $PuertoPrometheus, $PuertoLoki,
              $PuertoAlloy, $PuertoRecolector)
@@ -200,6 +198,14 @@ Get-ChildItem (Join-Path $DEPLOY "grafana\dashboards") -Filter *.json | ForEach-
 # ── Carpetas de datos (fuera del repositorio) ──────────────────────────────
 foreach ($sub in @("datos", "datos\loki", "datos\prometheus", "datos\alloy", "logs")) {
     New-Item -ItemType Directory -Force (Join-Path $OBS $sub) | Out-Null
+}
+
+# Lo usa servicios.ps1: los servicios no ejecutan este script, pero necesitan
+# que .generado exista y esté al día antes de arrancar.
+if ($SoloGenerar) {
+    ""
+    "Configuracion lista. Los servicios la leen de $GEN"
+    return
 }
 
 # ── Arrancar ───────────────────────────────────────────────────────────────

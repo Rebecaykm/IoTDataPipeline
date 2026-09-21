@@ -59,31 +59,43 @@ Si prefieres los binarios en otra ruta:
 [Environment]::SetEnvironmentVariable("IOT_OBS", "D:\binarios", "User")
 ```
 
-### Los puertos
+### Los puertos: todos en el `.env`
 
-| Pieza | Por omisión | Parámetro |
-|---|---:|---|
-| Grafana | 3000 | `-PuertoGrafana` |
-| Prometheus | 9090 | `-PuertoPrometheus` |
-| Loki | 3100 | `-PuertoLoki` |
-| Alloy | 12345 | `-PuertoAlloy` |
-| Recolector | 9100 | `HTTP_PORT` del `.env` |
-
-Si alguno está ocupado en el servidor:
-
-```powershell
-.\iniciar-observabilidad.ps1 -PuertoGrafana 8080 -PuertoLoki 3200
+```ini
+HTTP_PORT=9100          # el recolector
+PUERTO_GRAFANA=3000
+PUERTO_PROMETHEUS=9090
+PUERTO_LOKI=3100
+PUERTO_ALLOY=12345
 ```
 
-Van juntos a propósito. Un puerto aparece en cinco lugares —el proceso que
-escucha, lo que Prometheus raspa, las fuentes de datos de Grafana, a dónde
-empuja Alloy y el enlace del tablero de estaciones— y si uno se queda atrás,
-Grafana levanta bien pero con paneles vacíos y nada dice por qué. Por eso se
-escriben **una sola vez** aquí y el script los baja a las plantillas.
+Ese es el **único** lugar donde se escriben. La línea que falte toma el valor de
+arriba, así que un `.env` sin ninguna de ellas funciona igual que siempre.
 
-**El del recolector no se pasa por parámetro**: el script lo lee del `HTTP_PORT`
-del `.env`, que es de donde lo toma el propio recolector. Repetirlo sería
-justamente la forma de desincronizarlo.
+Un puerto aparece en cinco sitios: el proceso que escucha, lo que Prometheus
+raspa, las fuentes de datos de Grafana, a dónde empuja Alloy y el enlace del
+tablero de estaciones. Si uno se queda atrás, Grafana levanta bien pero con los
+paneles vacíos y nada dice por qué. Por eso los lee
+[`puertos.ps1`](puertos.ps1), que usan los dos scripts, y de ahí bajan a las
+plantillas.
+
+Al cambiar uno:
+
+```powershell
+.\servicios.ps1 reiniciar
+```
+
+Para probar un puerto **sin** tocar el archivo, los parámetros siguen ahí:
+
+```powershell
+.\iniciar-observabilidad.ps1 -PuertoGrafana 8080
+```
+
+Y para ver cuál está ocupado y por quién:
+
+```powershell
+.\servicios.ps1 estado
+```
 
 ---
 
@@ -226,44 +238,44 @@ cierre de sesión y NSSM lo relanza si se cae.
 Primero, NSSM (portable, sin instalador): bajar de <https://nssm.cc/download> y
 descomprimir `win64\nssm.exe` en `C:\iot\obs\nssm\`.
 
-**El recolector** tiene su propio script, porque la ruta del entorno de Python
-cambia en cada máquina y escribirla a mano se presta a errores:
+Después, un solo comando, con **PowerShell como Administrador**:
 
 ```powershell
 cd <ruta-del-proyecto>\deploy
-.\servicio-recolector.ps1 estado       # ver cómo está (no pide administrador)
-.\servicio-recolector.ps1 instalar     # como Administrador
-.\servicio-recolector.ps1 reiniciar    # después de cada despliegue
-.\servicio-recolector.ps1 quitar
+.\servicios.ps1 instalar     # los cinco: recolector, Prometheus, Loki, Alloy, Grafana
 ```
 
-Resuelve el Python del entorno con `poetry env info`, avisa si hay un recolector
-suelto corriendo —que junto con el servicio contaría la producción doble— y deja
-el servicio en arranque automático con reinicio si se cae.
+| Comando | Qué hace |
+|---|---|
+| `.\servicios.ps1 estado` | tabla con estado, arranque y puerto (no pide administrador) |
+| `.\servicios.ps1 instalar` | registra y arranca |
+| `.\servicios.ps1 reiniciar` | después de cada `git pull` |
+| `.\servicios.ps1 quitar` | da de baja |
 
-> Si el entorno de Poetry vive dentro del perfil del usuario, el servicio corre
-> como LocalSystem y puede no tener acceso. Lo más robusto es dejarlo junto al
-> código: `poetry config virtualenvs.in-project true` y `poetry install`. El
-> script te lo avisa si detecta ese caso.
+Con `-Que recolector` o `-Que observabilidad` actúa solo sobre esa parte.
+`servicio-recolector.ps1` es un atajo de `-Que recolector`.
 
-**Los otros tres** se registran directo, con las rutas de `.generado` que imprime
-`iniciar-observabilidad.ps1`:
+El script resuelve el Python del entorno, regenera `.generado` con las rutas y
+puertos de la máquina, mata cualquier recolector que esté corriendo fuera del
+servicio —que junto con el servicio contaría la producción doble— y deja los
+cinco en arranque automático con reinicio si se caen.
 
-```powershell
-$nssm = "C:\iot\obs\nssm\nssm.exe"
-$gen  = "<ruta-del-proyecto>\deploy\.generado"
+**Son cinco servicios y no uno** a propósito: así NSSM vigila y relanza cada
+proceso por separado. Si colgaran de un solo servicio, la caída de Grafana —que
+solo sirve para *ver*— se llevaría entre las patas al recolector, que es el que
+no puede faltar.
 
-& $nssm install IoT-Prometheus C:\iot\obs\prometheus\prometheus.exe `
-    "--config.file=$gen\prometheus.yml --storage.tsdb.path=C:\iot\obs\datos\prometheus"
-
-& $nssm install IoT-Loki  C:\iot\obs\loki\loki-windows-amd64.exe  "-config.file=$gen\loki.yml"
-
-& $nssm install IoT-Alloy C:\iot\obs\alloy\alloy-windows-amd64.exe `
-    "run $gen\alloy.alloy --storage.path=C:\iot\obs\datos\alloy"
-```
-
-Como los servicios no ejecutan el script de arranque, hay que correrlo **una
-vez** antes de registrarlos para que `.generado` exista.
+> **El entorno de Python.** El servicio corre como LocalSystem. Si el entorno
+> vive en el caché de Poetry, dentro de un perfil de usuario, puede no tener
+> acceso. Déjalo junto al código:
+> ```powershell
+> poetry config virtualenvs.in-project true
+> poetry env list                   # ver cómo se llama el que existe
+> poetry env remove <ese-nombre>    # por nombre: --all no borra nada
+> poetry install                    # lo recrea en <proyecto>\.venv
+> ```
+> Poner `in-project` en `true` **no mueve** el entorno que ya existe: solo
+> aplica a los nuevos. Por eso hay que borrar el viejo.
 
 ---
 
