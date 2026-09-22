@@ -8,6 +8,7 @@ ESTADO FINAL de los registros —"la orden quedó en 900 y Completada"— en vez
 sobre la forma del SQL, que es lo que de verdad importa en la planta.
 """
 
+import copy
 import datetime as _dt
 
 from persistence import ordenes as ord_sql
@@ -304,14 +305,22 @@ class BaseFalsa:
 
 
 class ConexionFalsa:
-    """La conexión que devuelve create_connection() en las pruebas."""
+    """
+    La conexión que devuelve create_connection() en las pruebas.
+
+    Tiene transacción de verdad —snapshot al abrir el cursor, restaurar en
+    rollback— porque sin eso no se puede comprobar lo que importa de un
+    interbloqueo: que al revertirse NO queda nada escrito a medias y que el
+    reintento no duplica lo que el primer intento alcanzó a aplicar.
+    """
 
     class _Contexto:
-        def __init__(self, cursor):
-            self.cursor = cursor
+        def __init__(self, conexion):
+            self.conexion = conexion
 
         def __enter__(self):
-            return self.cursor
+            self.conexion._abrir_transaccion()
+            return self.conexion.base
 
         def __exit__(self, *_):
             return False
@@ -319,9 +328,27 @@ class ConexionFalsa:
     def __init__(self, base):
         self.base = base
         self.commits = 0
+        self.rollbacks = 0
+        self._respaldo = None
 
     def cursor(self):
-        return self._Contexto(self.base)
+        return self._Contexto(self)
+
+    def _abrir_transaccion(self):
+        if self._respaldo is None:
+            self._respaldo = copy.deepcopy((
+                self.base.registros, self.base.historias, self.base.histories,
+                self.base.transiciones, self.base._siguiente_id,
+            ))
 
     def commit(self):
         self.commits += 1
+        self._respaldo = None
+
+    def rollback(self):
+        self.rollbacks += 1
+        if self._respaldo is None:
+            return
+        (self.base.registros, self.base.historias, self.base.histories,
+         self.base.transiciones, self.base._siguiente_id) = self._respaldo
+        self._respaldo = None

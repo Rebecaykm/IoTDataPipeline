@@ -13,11 +13,14 @@ Qué guarda cada entrada:
     numero_original    lo que mandó el PLC, sin resolver
     lado               LH / RH / --
     part_number_id     id de la parte, resuelto una vez por corrida
+    visto_en           epoch de la última lectura en que el PLC la reportó;
+                       decide cuándo se puede olvidar su línea base
 """
 
 import json
 import logging
 import os
+import time
 from datetime import datetime
 
 logger = logging.getLogger("supervisor")
@@ -84,6 +87,13 @@ def cargar_estado(state_file, ip):
                 if not any(clave.endswith(suf) for suf in
                            ['_GLOBAL', '_RH', '_LH', '_RH REAR', '_LH REAR', '_--']):
                     clave = f"{clave}_GLOBAL"
+
+                # Los archivos anteriores a este campo no dicen cuándo se vio
+                # por última vez. Tomarlo como 0 las daría por ausentes desde
+                # 1970 y el primer hueco del PLC borraría TODAS las líneas base
+                # recién recuperadas. Se cuentan como vistas al arrancar.
+                if not record.get('visto_en'):
+                    record['visto_en'] = time.time()
 
                 if 'numero_original' not in record:
                     validated_part = clave.split('_', 1)[1] if '_' in clave else ''

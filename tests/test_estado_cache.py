@@ -7,6 +7,7 @@ anterior, porque confunden a quien abre el JSON a diagnosticar.
 """
 
 import json
+import time
 
 from persistence import estado as estado_store
 
@@ -95,10 +96,46 @@ class TestCarga:
 
         estado_store.guardar_estado(archivo, estado_store.cargar_estado(archivo, IP), IP)
 
-        assert json.loads(archivo.read_text(encoding="utf-8")) == {
+        guardado = json.loads(archivo.read_text(encoding="utf-8"))["MK05_DA6A5361YA_LH"]
+        assert guardado["contador_registro"] == 5
+        assert guardado["numero_original"] == "DA6A5361YA"
+        for obsoleto in estado_store.OBSOLETOS:
+            assert obsoleto not in guardado
+
+
+class TestVistoEn:
+    """
+    Cuándo se vio por última vez cada parte. Decide si al desaparecer se
+    conserva su línea base o se olvida.
+    """
+
+    def test_a_un_archivo_viejo_se_le_pone_la_hora_de_arranque(self, tmp_path):
+        """
+        Sin esto valdría 0 —o sea, ausente desde 1970— y el primer hueco del
+        PLC borraría TODAS las líneas base que se acaban de recuperar.
+        """
+        archivo = tmp_path / "state.json"
+        archivo.write_text(json.dumps({
             "MK05_DA6A5361YA_LH": {"contador_registro": 5,
                                    "numero_original": "DA6A5361YA"}
-        }
+        }), encoding="utf-8")
+
+        antes = time.time()
+        cargado = estado_store.cargar_estado(archivo, IP)["MK05_DA6A5361YA_LH"]
+
+        assert cargado["visto_en"] >= antes
+
+    def test_respeta_el_que_ya_traia(self, tmp_path):
+        archivo = tmp_path / "state.json"
+        archivo.write_text(json.dumps({
+            "MK05_DA6A5361YA_LH": {"contador_registro": 5,
+                                   "numero_original": "DA6A5361YA",
+                                   "visto_en": 1_700_000_000.0}
+        }), encoding="utf-8")
+
+        cargado = estado_store.cargar_estado(archivo, IP)["MK05_DA6A5361YA_LH"]
+
+        assert cargado["visto_en"] == 1_700_000_000.0
 
     def test_sin_archivo_arranca_vacio(self, tmp_path):
         assert estado_store.cargar_estado(tmp_path / "no_existe.json", IP) == {}
