@@ -80,7 +80,8 @@
       "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
       "targets": [{
         "refId": "A", "type": "json", "source": "url", "format": "table",
-        "url": "/partes-rechazadas", "url_options": { "method": "GET" },
+        "url": "/partes-rechazadas?desde=${__from:date:YYYY-MM-DD}&hasta=${__to:date:YYYY-MM-DD}",
+        "url_options": { "method": "GET" },
         "root_selector": "rechazos",
         "columns": [
           { "selector": "ultima_vez", "text": "Última vez", "type": "string" },

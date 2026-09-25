@@ -149,6 +149,49 @@ class TestRechazosStore:
     def test_archivo_inexistente_devuelve_vacio(self, tmp_path):
         assert RechazosStore(tmp_path / "no-existe.jsonl").leer() == []
 
+    def _escribir(self, ruta, fecha, numero_plc):
+        """
+        Una línea con fecha elegida a mano. registrar() siempre usa hoy, y
+        estas pruebas necesitan días distintos para probar desde/hasta.
+        """
+        with ruta.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "fecha": fecha, "ts": f"{fecha}T08:00:00",
+                "estacion": "MK05", "lado": "LH", "area": "Chasis",
+                "numero_plc": numero_plc, "tipo_error": "E",
+            }) + "\n")
+
+    def test_hasta_acota_por_arriba(self, tmp_path):
+        """
+        El uso pensado: elegir un solo día en el selector de Grafana (desde =
+        hasta = ese día) y ver solo lo de ese día, ni antes ni después.
+        """
+        ruta = tmp_path / "r.jsonl"
+        self._escribir(ruta, "2026-09-19", "A")
+        self._escribir(ruta, "2026-09-20", "B")
+        self._escribir(ruta, "2026-09-21", "C")
+
+        filas = RechazosStore(ruta).leer(desde="2026-09-20", hasta="2026-09-20")
+
+        assert [f["numero_plc"] for f in filas] == ["B"]
+
+    def test_hasta_es_inclusivo(self, tmp_path):
+        ruta = tmp_path / "r.jsonl"
+        self._escribir(ruta, "2026-09-20", "B")
+
+        assert RechazosStore(ruta).leer(desde="2026-09-20", hasta="2026-09-20") != []
+        assert RechazosStore(ruta).leer(desde="2026-09-20", hasta="2026-09-19") == []
+
+    def test_sin_hasta_no_acota_por_arriba(self, tmp_path):
+        """El comportamiento de siempre: desde X en adelante, sin techo."""
+        ruta = tmp_path / "r.jsonl"
+        self._escribir(ruta, "2026-09-20", "B")
+        self._escribir(ruta, "2026-09-25", "C")
+
+        filas = RechazosStore(ruta).leer(desde="2026-09-20")
+
+        assert {f["numero_plc"] for f in filas} == {"B", "C"}
+
     def test_registrar_nunca_lanza(self, tmp_path):
         """Registrar un rechazo jamás debe tumbar el conteo de producción."""
         s = RechazosStore(tmp_path / "sub" / "no-existe" / "r.jsonl")

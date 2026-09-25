@@ -111,10 +111,11 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json({"error": "bitácora no configurada"}, 503)
                     return
                 desde = params.get("desde", [None])[0]
+                hasta = params.get("hasta", [None])[0]
                 limite = int(params.get("limite", ["1000"])[0])
                 self._json({
                     "generado": datetime.now().isoformat(timespec="seconds"),
-                    "rechazos": _rechazos_store.leer(desde=desde, limite=limite),
+                    "rechazos": _rechazos_store.leer(desde=desde, hasta=hasta, limite=limite),
                 })
 
             elif camino.startswith("/debug/plc"):

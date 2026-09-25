@@ -91,12 +91,15 @@ class RechazosStore:
             logger.error(f"Error registrando rechazo de {numero_plc} en {estacion}: {e}")
             return False
 
-    def leer(self, desde=None, limite=1000):
+    def leer(self, desde=None, hasta=None, limite=1000):
         """
         Devuelve los rechazos para el tablero, agrupados por
         (estación, lado, número, motivo) con su conteo y última hora.
 
-        `desde` es 'YYYY-MM-DD'; por omisión, hoy.
+        `desde` y `hasta` son 'YYYY-MM-DD', ambos inclusive. `desde` por
+        omisión es hoy; `hasta` por omisión no acota (hasta el final). El
+        formato ISO ordena igual como texto que como fecha, así que la
+        comparación de cadenas basta — no hace falta parsear.
         """
         desde = desde or date.today().isoformat()
         if not self.path.exists():
@@ -113,7 +116,8 @@ class RechazosStore:
                         r = json.loads(linea)
                     except json.JSONDecodeError:
                         continue
-                    if r.get("fecha", "") < desde:
+                    fecha = r.get("fecha", "")
+                    if fecha < desde or (hasta and fecha > hasta):
                         continue
 
                     clave = (r.get("estacion"), r.get("lado"),
