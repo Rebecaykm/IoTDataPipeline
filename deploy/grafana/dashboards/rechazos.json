@@ -6,6 +6,7 @@
   "refresh": "30s",
   "schemaVersion": 39,
   "time": { "from": "now-24h", "to": "now" },
+  "timepicker": { "hidden": true },
   "links": [
     { "type": "dashboards", "title": "IoT Planta", "tags": ["iot"], "asDropdown": false, "icon": "external link" }
   ],
@@ -65,7 +66,7 @@
 
     {
       "type": "timeseries", "title": "Rechazos por hora y motivo — últimos 90 días", "id": 10,
-      "description": "Fijo a 90 días (lo que retiene Prometheus): no sigue el selector de tiempo, que en este tablero solo controla el panel de Detalle.",
+      "description": "Fijo a 90 días, lo que retiene Prometheus. Este tablero no tiene selector de tiempo: todo se muestra completo.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
       "timeFrom": "90d",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -80,12 +81,12 @@
 
     {
       "type": "table", "title": "Detalle — clic en la estación abre su log", "id": 20,
-      "description": "Una fila por día: la misma estación+parte+motivo en días distintos sale en filas distintas, cada una con su propia hora. La más vieja dice desde cuándo pasa; si la más nueva es de hoy, sigue pasando. El único panel que sigue el selector de tiempo de arriba.",
+      "description": "Todo el historial, una fila por día: la misma estación+parte+motivo en días distintos sale en filas distintas. Para ver solo un día, pasa el mouse sobre la columna Fecha y usa su filtro (el embudo que aparece en el encabezado) — no hay selector de tiempo en este tablero.",
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 12 },
       "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
       "targets": [{
         "refId": "A", "type": "json", "source": "url", "format": "table",
-        "url": "/partes-rechazadas?desde=${__from:date:YYYY-MM-DD}&hasta=${__to:date:YYYY-MM-DD}",
+        "url": "/partes-rechazadas?desde=2000-01-01",
         "url_options": { "method": "GET" },
         "root_selector": "rechazos",
         "columns": [
