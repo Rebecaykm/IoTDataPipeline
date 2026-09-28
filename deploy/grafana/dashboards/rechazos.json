@@ -11,13 +11,13 @@
   ],
   "panels": [
     {
-      "type": "stat", "title": "Rechazos hoy", "id": 1,
+      "type": "stat", "title": "Días-problema, todo el historial", "id": 1,
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "description": "Cada ocurrencia, no una por día: así se distingue un alta faltante de un incidente aislado.",
+      "description": "Cuenta días, no ciclos del PLC: cada combinación estación+parte+motivo suma 1 por cada día distinto en que se vio, sin importar cuántas veces se consultó el PLC ese día. No sigue el selector de tiempo — es todo el historial.",
       "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
       "targets": [{
         "refId": "A", "type": "json", "source": "url", "format": "table",
-        "url": "/partes-rechazadas", "url_options": { "method": "GET" },
+        "url": "/partes-rechazadas?desde=2000-01-01", "url_options": { "method": "GET" },
         "root_selector": "rechazos",
         "columns": [{ "selector": "veces", "text": "veces", "type": "number" }]
       }],
@@ -32,12 +32,13 @@
       }
     },
     {
-      "type": "stat", "title": "Números distintos", "id": 2,
+      "type": "stat", "title": "Números distintos, todo el historial", "id": 2,
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "description": "No sigue el selector de tiempo — es todo el historial.",
       "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
       "targets": [{
         "refId": "A", "type": "json", "source": "url", "format": "table",
-        "url": "/partes-rechazadas", "url_options": { "method": "GET" },
+        "url": "/partes-rechazadas?desde=2000-01-01", "url_options": { "method": "GET" },
         "root_selector": "rechazos",
         "columns": [{ "selector": "numero_plc", "text": "numero", "type": "string" }]
       }],
@@ -46,6 +47,7 @@
     },
     {
       "type": "stat", "title": "Estaciones afectadas", "id": 3,
+      "description": "El contador de Prometheus no se reinicia solo: es acumulado desde que arrancó, no del rango elegido.",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [{ "refId": "A", "expr": "count(count by (estacion) (partes_rechazadas_total))", "legendFormat": "estaciones" }],
@@ -62,8 +64,10 @@
     },
 
     {
-      "type": "timeseries", "title": "Rechazos por hora y motivo", "id": 10,
+      "type": "timeseries", "title": "Rechazos por hora y motivo — últimos 90 días", "id": 10,
+      "description": "Fijo a 90 días (lo que retiene Prometheus): no sigue el selector de tiempo, que en este tablero solo controla el panel de Detalle.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "timeFrom": "90d",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [{
         "refId": "A",
@@ -76,6 +80,7 @@
 
     {
       "type": "table", "title": "Detalle — clic en la estación abre su log", "id": 20,
+      "description": "Una fila por día: la misma estación+parte+motivo en días distintos sale en filas distintas, cada una con su propia hora. La más vieja dice desde cuándo pasa; si la más nueva es de hoy, sigue pasando. El único panel que sigue el selector de tiempo de arriba.",
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 12 },
       "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
       "targets": [{
@@ -84,28 +89,19 @@
         "url_options": { "method": "GET" },
         "root_selector": "rechazos",
         "columns": [
-          { "selector": "ultima_vez", "text": "Última vez", "type": "string" },
+          { "selector": "fecha", "text": "Fecha", "type": "string" },
+          { "selector": "ultima_vez", "text": "Hora", "type": "string" },
           { "selector": "estacion", "text": "Estación", "type": "string" },
           { "selector": "lado", "text": "Lado", "type": "string" },
           { "selector": "area", "text": "Área", "type": "string" },
           { "selector": "numero_plc", "text": "Número del PLC", "type": "string" },
-          { "selector": "tipo_error", "text": "Motivo", "type": "string" },
-          { "selector": "veces", "text": "Veces", "type": "number" },
-          { "selector": "primera_vez", "text": "Primera vez", "type": "string" }
+          { "selector": "tipo_error", "text": "Motivo", "type": "string" }
         ]
       }],
-      "options": { "showHeader": true, "cellHeight": "sm", "sortBy": [{ "displayName": "Veces", "desc": true }] },
+      "options": { "showHeader": true, "cellHeight": "sm", "sortBy": [{ "displayName": "Fecha", "desc": true }] },
       "fieldConfig": {
         "defaults": { "custom": { "align": "auto", "filterable": true } },
         "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "Veces" },
-            "properties": [
-              { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
-              { "id": "color", "value": { "mode": "continuous-GrYlRd" } },
-              { "id": "min", "value": 0 }
-            ]
-          },
           {
             "matcher": { "id": "byName", "options": "Motivo" },
             "properties": [

@@ -97,32 +97,62 @@ class TestRegistroEstados:
 
 
 class TestRechazosStore:
-    def test_registra_y_agrupa_con_conteo(self, tmp_path):
-        """Lo que el CSV no podía: distinguir un alta faltante de un incidente."""
+    def test_por_omision_solo_escribe_una_vez_por_dia(self, tmp_path):
+        """
+        El bug real: una parte mal dada de alta la rechaza CADA lectura del
+        PLC — varias veces por minuto, no una por incidente. Sin este límite,
+        el archivo crece un renglón por ciclo mientras dure el problema.
+        """
         s = RechazosStore(tmp_path / "r.jsonl")
         for _ in range(96):
             s.registrar("MT05", "576960C010", "PART_NUMBER_NO_EXISTE_BD", lado="RH")
         s.registrar("MK05", "OTRA", "NO_PART_NUMBER", lado="LH")
 
         filas = s.leer()
-        assert filas[0]["numero_plc"] == "576960C010"
-        assert filas[0]["veces"] == 96
-        assert filas[0]["estacion"] == "MT05"
-        assert len(filas) == 2
+        assert len(filas) == 2, "una fila por combinación, no una por ciclo del PLC"
+        fila = next(f for f in filas if f["numero_plc"] == "576960C010")
+        assert fila["veces"] == 1
+        assert fila["estacion"] == "MT05"
 
-    def test_dedup_por_dia_opcional(self, tmp_path):
-        s = RechazosStore(tmp_path / "r.jsonl", dedup_por_dia=True)
-        assert s.registrar("MT05", "X", "E") is True
-        assert s.registrar("MT05", "X", "E") is False
-        assert s.leer()[0]["veces"] == 1
+    def test_un_lado_no_tapa_al_otro(self, tmp_path):
+        """
+        La clave de deduplicación llevaba estación+número+día, sin lado ni
+        motivo: un rechazo en LH marcaba como "ya visto" el de RH de la misma
+        parte ese día, y ese segundo rechazo se perdía sin dejar rastro.
+        """
+        s = RechazosStore(tmp_path / "r.jsonl")
+        assert s.registrar("MK05", "X", "E", lado="LH") is True
+        assert s.registrar("MK05", "X", "E", lado="RH") is True
+
+        filas = s.leer()
+        assert {f["lado"] for f in filas} == {"LH", "RH"}
+
+    def test_un_motivo_no_tapa_al_otro(self, tmp_path):
+        """Mismo caso que el lado, pero con el tipo de error."""
+        s = RechazosStore(tmp_path / "r.jsonl")
+        assert s.registrar("MK05", "X", "PART_NUMBER_NO_EXISTE_BD") is True
+        assert s.registrar("MK05", "X", "MDI_NO_EXISTE") is True
+
+        filas = s.leer()
+        assert {f["tipo_error"] for f in filas} == {"PART_NUMBER_NO_EXISTE_BD", "MDI_NO_EXISTE"}
+
+    def test_se_puede_apagar_para_seguir_contando_ciclos(self, tmp_path):
+        """dedup_por_dia=False sigue disponible para quien quiera la cuenta cruda."""
+        s = RechazosStore(tmp_path / "r.jsonl", dedup_por_dia=False)
+        for _ in range(5):
+            s.registrar("MT05", "X", "E")
+
+        assert s.leer()[0]["veces"] == 5
 
     def test_el_indice_sobrevive_al_reinicio(self, tmp_path):
         ruta = tmp_path / "r.jsonl"
-        s1 = RechazosStore(ruta, dedup_por_dia=True)
-        s1.registrar("MT05", "X", "E")
+        s1 = RechazosStore(ruta)
+        s1.registrar("MT05", "X", "E", lado="LH")
 
-        s2 = RechazosStore(ruta, dedup_por_dia=True)   # "reinicio"
-        assert s2.registrar("MT05", "X", "E") is False
+        s2 = RechazosStore(ruta)   # "reinicio"
+        assert s2.registrar("MT05", "X", "E", lado="LH") is False
+        assert s2.registrar("MT05", "X", "E", lado="RH") is True, \
+            "el índice recargado también debe distinguir por lado"
 
     def test_linea_corrupta_no_tumba_la_lectura(self, tmp_path):
         ruta = tmp_path / "r.jsonl"
@@ -191,6 +221,24 @@ class TestRechazosStore:
         filas = RechazosStore(ruta).leer(desde="2026-09-20")
 
         assert {f["numero_plc"] for f in filas} == {"B", "C"}
+
+    def test_el_mismo_problema_en_dias_distintos_no_se_junta(self, tmp_path):
+        """
+        La misma estación+parte+motivo, tres días seguidos: tres filas, no una
+        con 'veces': 3. Mezclarlas en una sola perdería justo lo que importa —
+        desde cuándo pasa (la más vieja) y si sigue pasando (la más nueva).
+        """
+        ruta = tmp_path / "r.jsonl"
+        self._escribir(ruta, "2026-09-19", "REPETIDA")
+        self._escribir(ruta, "2026-09-20", "REPETIDA")
+        self._escribir(ruta, "2026-09-21", "REPETIDA")
+
+        filas = RechazosStore(ruta).leer(desde="2026-09-19")
+
+        assert len(filas) == 3
+        assert all(f["veces"] == 1 for f in filas)
+        assert [f["fecha"] for f in filas] == ["2026-09-21", "2026-09-20", "2026-09-19"], \
+            "la más reciente primero"
 
     def test_registrar_nunca_lanza(self, tmp_path):
         """Registrar un rechazo jamás debe tumbar el conteo de producción."""

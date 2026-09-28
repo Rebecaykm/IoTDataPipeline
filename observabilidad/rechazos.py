@@ -22,15 +22,20 @@ logger = logging.getLogger("supervisor")
 
 class RechazosStore:
     """
-    Registra cada rechazo de número de parte.
+    Registra cada rechazo de número de parte, UNA vez por día.
 
-    `dedup_por_dia=True` conserva el comportamiento anterior (una fila por
-    estación+número+día). En False registra cada ocurrencia, que es lo que
-    permite distinguir "un alta faltante golpeando cada ciclo" de "un incidente
-    aislado" — la columna 'veces' del tablero.
+    Con `dedup_por_dia=False` cada ciclo del PLC que siguiera viendo la misma
+    parte rechazada escribía una línea — una estación con una parte mal dada de
+    alta llenaba el archivo a razón de un renglón por segundo. `True` (el valor
+    de siempre ahora) escribe solo la primera vez que se ve esa combinación en
+    el día; el resto del día se reconoce y se descarta sin tocar el archivo.
+
+    La clave de "ya lo vi hoy" es (estación, número, lado, motivo, día): con
+    menos campos, un rechazo en LH tapaba uno distinto en RH de la misma parte
+    ese día, y se perdía sin que quedara registro.
     """
 
-    def __init__(self, path, dedup_por_dia=False):
+    def __init__(self, path, dedup_por_dia=True):
         self.path = Path(path)
         self.dedup_por_dia = dedup_por_dia
         self._vistos = set()
@@ -49,7 +54,9 @@ class RechazosStore:
                         continue
                     try:
                         r = json.loads(linea)
-                        self._vistos.add((r["estacion"], r["numero_plc"], r["fecha"]))
+                        self._vistos.add((r["estacion"], r["numero_plc"],
+                                          r.get("lado", "--"), r["tipo_error"],
+                                          r["fecha"]))
                     except (json.JSONDecodeError, KeyError):
                         continue  # línea corrupta: se ignora, no tumba el resto
             logger.info(f"📋 Bitácora de rechazos: {len(self._vistos)} combinación(es) previas")
@@ -64,7 +71,7 @@ class RechazosStore:
         """
         hoy = date.today().isoformat()
         numero = _limpiar(numero_plc)
-        clave = (estacion, numero, hoy)
+        clave = (estacion, numero, lado, tipo_error, hoy)
 
         try:
             with self._lock:
@@ -93,8 +100,15 @@ class RechazosStore:
 
     def leer(self, desde=None, hasta=None, limite=1000):
         """
-        Devuelve los rechazos para el tablero, agrupados por
-        (estación, lado, número, motivo) con su conteo y última hora.
+        Devuelve los rechazos para el tablero, UNA fila por día: agrupados por
+        (estación, lado, número, motivo, día), no mezclados entre días.
+
+        Con `dedup_por_dia` escribiendo a lo más una línea por combinación y
+        día, agrupar sin el día habría vuelto a juntar semanas de historia en
+        un solo renglón — la misma pieza aparecería siempre, solo que ahora con
+        'veces' contando días en vez de ciclos del PLC. Separado por día se ve
+        cuándo empezó (la fila más vieja) y si sigue pasando (la más nueva es
+        de hoy), en vez de un total que no dice ni lo uno ni lo otro.
 
         `desde` y `hasta` son 'YYYY-MM-DD', ambos inclusive. `desde` por
         omisión es hoy; `hasta` por omisión no acota (hasta el final). El
@@ -121,10 +135,11 @@ class RechazosStore:
                         continue
 
                     clave = (r.get("estacion"), r.get("lado"),
-                             r.get("numero_plc"), r.get("tipo_error"))
+                             r.get("numero_plc"), r.get("tipo_error"), fecha)
                     fila = agrupado.get(clave)
                     if fila is None:
                         agrupado[clave] = {
+                            "fecha": fecha,
                             "estacion": r.get("estacion"),
                             "lado": r.get("lado"),
                             "area": r.get("area", ""),
@@ -135,13 +150,16 @@ class RechazosStore:
                             "ultima_vez": r.get("ts"),
                         }
                     else:
+                        # Solo pasa con un archivo viejo, de antes de este cambio,
+                        # donde sí se escribía una línea por ciclo del PLC.
                         fila["veces"] += 1
                         fila["ultima_vez"] = r.get("ts")
         except Exception as e:
             logger.error(f"Error leyendo la bitácora de rechazos: {e}")
             return []
 
-        filas = sorted(agrupado.values(), key=lambda x: x["veces"], reverse=True)
+        filas = sorted(agrupado.values(),
+                       key=lambda x: (x["fecha"], x["veces"]), reverse=True)
         return filas[:limite]
 
 
