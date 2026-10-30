@@ -137,41 +137,6 @@ RECONNECT_DELAY = 10        # 10 segundos entre reconexiones fallidas
 PLC_IO_WORKERS = int(os.getenv('PLC_IO_WORKERS', '16'))  # 1 hilo por PLC concurrente
 DB_WORKERS = int(os.getenv('DB_WORKERS', '8'))           # limita conexiones SQL vivas
 
-# Fecha límite hacia atrás para rescatar órdenes pendientes: no se toca ninguna
-# orden planeada ANTES de este día. Es una fecha fija, no una ventana móvil, para
-# que el corte no se recorra solo con el paso de los días.
-# La orden que se está llenando se retoma siempre, sin importar su fecha.
-ORDENES_DESDE_DEFECTO = date(2000, 1, 1)
-
-
-def _fecha_limite_ordenes():
-    """
-    Lee ORDENES_DESDE del .env como 'AAAA-MM-DD'.
-
-    Si falta o viene mal, se usa una fecha muy antigua a propósito: con un corte
-    demasiado reciente el recolector no encontraría NINGUNA orden y mandaría
-    toda la producción a No planeado, en silencio. Es preferible rescatar
-    órdenes viejas —que se ven y se corrigen— a perder el enlace con el plan.
-    """
-    crudo = (os.getenv('ORDENES_DESDE') or '').strip()
-    if not crudo:
-        logger.warning(
-            "⚠️ ORDENES_DESDE no está en el .env: se rescatarán órdenes desde "
-            f"{ORDENES_DESDE_DEFECTO}. Ponle la fecha de corte que corresponda."
-        )
-        return ORDENES_DESDE_DEFECTO
-    try:
-        return datetime.strptime(crudo, '%Y-%m-%d').date()
-    except ValueError:
-        logger.error(
-            f"❌ ORDENES_DESDE='{crudo}' no tiene el formato AAAA-MM-DD. "
-            f"Se usa {ORDENES_DESDE_DEFECTO} para no perder producción."
-        )
-        return ORDENES_DESDE_DEFECTO
-
-
-ORDENES_DESDE = _fecha_limite_ordenes()
-
 _plc_executor = ThreadPoolExecutor(max_workers=PLC_IO_WORKERS, thread_name_prefix="plc-io")
 _db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="db")
 
@@ -1258,8 +1223,6 @@ class IPDataProcessor:
                     hora = now.time().replace(microsecond=0)
                     turno, fecha_plan = safe_get_current_shift(hora)
                     fecha_fmt = now.strftime('%Y-%m-%d %H:%M:%S')
-                    # Fecha fija de corte: no se tocan órdenes planeadas antes de ahí.
-                    desde_fecha = ORDENES_DESDE
                     # Qué partes venían ya en corrida ANTES de este ciclo. Se resuelve
                     # una sola vez por parte para que los dos lados de la estación vean
                     # el mismo panorama (ver _linea_base_de_corrida).
@@ -1379,6 +1342,13 @@ class IPDataProcessor:
                             f"⚠️ Lectura parcial del PLC en {estacion}: se omite el fin de "
                             f"corrida de las partes ausentes para no perder su contador base."
                         )
+
+                    # Régimen del sobrante para este ciclo (ver más abajo):
+                    # se calcula perezosamente, una sola vez, justo antes del
+                    # primer incremento real que haya que registrar. Calcularlo
+                    # aquí arriba costaría una consulta en cada ciclo, incluso
+                    # en los que ninguna parte avanzó.
+                    flavor = None
 
                     for d in datos:
                         num = d['parte']
@@ -1520,10 +1490,22 @@ class IPDataProcessor:
                                               {'troquel_id': _troquel}, log,
                                               shop_order_number=orden_num)
 
+                        if flavor is None:
+                            # Corte por estación, leído fresco en cada ciclo: se
+                            # edita desde una interfaz web ajena a este repo y
+                            # debe surtir efecto sin reiniciar el servicio. Sin
+                            # fila, o antes de esa fecha, el sobrante va a la
+                            # cuarentena (No verificado); ya pasado el corte, al
+                            # flujo de siempre (No planeado).
+                            sync_from = ordenes.obtener_sync_from(cursor, estacion)
+                            flavor = (ordenes.NO_PLANEADO
+                                      if sync_from is not None and fecha_plan >= sync_from
+                                      else ordenes.NO_VERIFICADO)
+
                         resultado = ordenes.registrar_incremento(
                             cursor, estacion, num, incremento, multiplicador,
-                            desde_fecha=desde_fecha, fecha_plan=fecha_plan, turno=turno,
-                            fecha_fmt=fecha_fmt, anotar_history=anotar_historial, log=log,
+                            fecha_plan=fecha_plan, turno=turno, fecha_fmt=fecha_fmt,
+                            flavor=flavor, anotar_history=anotar_historial, log=log,
                         )
 
                         if resultado.error:
@@ -1561,9 +1543,6 @@ class IPDataProcessor:
                             if resultado.cerradas:
                                 obs_metricas.ordenes_completadas.labels(
                                     estacion, str(area)).inc(len(resultado.cerradas))
-                            if resultado.no_planeado:
-                                obs_metricas.produccion_no_planeada.labels(
-                                    estacion, lado_actual, str(area)).inc(resultado.no_planeado)
                             if tiempo:
                                 obs_metricas.plc_tiempo_ciclo.labels(estacion, lado_actual).set(tiempo)
                         except Exception:

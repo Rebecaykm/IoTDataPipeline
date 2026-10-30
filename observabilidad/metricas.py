@@ -62,10 +62,6 @@ ordenes_completadas = Counter(
     "ordenes_completadas_total", "Órdenes que llegaron a su cantidad planeada",
     ["estacion", "area"],
 )
-produccion_no_planeada = Counter(
-    "produccion_no_planeada_total", "Piezas producidas sin una orden que las respalde",
-    ["estacion", "lado", "area"],
-)
 
 # ── Estado clasificado (para alertar sin leer el snapshot) ─────────────────
 # `area` no multiplica series: cada estación pertenece a una sola. Se incluye

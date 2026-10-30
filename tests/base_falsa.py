@@ -64,11 +64,14 @@ class BaseFalsa:
     en la base real.
     """
 
-    def __init__(self, registros=(), partes=None, multiplicadores=None):
+    def __init__(self, registros=(), partes=None, multiplicadores=None, sync_from=None):
         self.registros = {r.id: r for r in registros}
         self.partes = set(partes or [(r.estacion, r.numero) for r in registros])
         #: pieces_per_shot por (estacion, numero). Solo Estampado lo consulta.
         self.multiplicadores = dict(multiplicadores or {})
+        #: sync_from falso por estación, simula infor_sync_work_centers.
+        #: Ausente = la estación no tiene fila (régimen No verificado).
+        self.sync_from = dict(sync_from or {})
         self.historias = []          # [(id_registro, orden, cantidad)] del callback
         self.histories = []          # filas tal como entrarían a la tabla
         self.consultas = []          # SQL lanzado, para contar viajes a la base
@@ -96,13 +99,21 @@ class BaseFalsa:
         if "produced_quantity + ? > planned_quantity" in sql:
             return self._sumar_a_orden(p[0], p[2], p[4])
         if "SET produced_quantity = produced_quantity + ?" in sql:
-            return self._sumar_a_no_planeado(p[0], p[1], p[2], p[4])
+            return self._sumar_a_no_planeado(p[0], p[1], p[2], p[4], p[5])
         if f"status_id = {ord_sql.COMPLETADO}" in sql:
             return self._completar(p[1], p[0])
+        # detener() y detener_estacion() comparten el mismo patrón "UPDATE pr
+        # SET ... FROM ... LEFT JOIN infor_sync_work_centers"; se distinguen
+        # por el WHERE (por id, o por nombre de estación) y hay que mirar eso
+        # ANTES de la rama genérica de abajo.
+        if "WHERE pr.id = ?" in sql:
+            return self._detener(p[1], p[0])
         if "UPDATE pr SET" in sql:
             return self._detener_estacion(p[1], p[0])
-        if "SET status_id = CASE WHEN shop_order_number IS NULL" in sql:
-            return self._detener(p[1], p[0])
+        if "NOT (" in sql:
+            return self._buscar_vencido(*p)
+        if "infor_sync_work_centers" in sql:
+            return self._sync_from(*p)
         if "pr.shop_order_number IS NULL" in sql:
             return self._buscar_no_planeado(*p)
         if f"pr.status_id = {ord_sql.EN_PROGRESO}" in sql and "SELECT TOP(1)" in sql:
@@ -117,6 +128,19 @@ class BaseFalsa:
             return self._insertar_history(sql, p)
         raise AssertionError(f"consulta no contemplada por la base falsa:\n{sql}")
 
+    def _status_final(self, registro):
+        """
+        Mismo criterio que el CASE de SQL_DETENER / SQL_DETENER_ESTACION:
+        con orden -> Detenido; sin orden, según el sync_from de la estación
+        en este momento -> No planeado o No verificado.
+        """
+        if registro.orden is not None:
+            return ord_sql.DETENIDO
+        corte = self.sync_from.get(registro.estacion)
+        if corte is not None and registro.planned_date >= _fecha(corte):
+            return ord_sql.NO_PLANEADO
+        return ord_sql.NO_VERIFICADO
+
     def _cambiar_status(self, registro, nuevo):
         """Deja rastro de cada cambio de estado, aunque se revierta después."""
         if registro.status != nuevo:
@@ -124,17 +148,17 @@ class BaseFalsa:
             registro.status = nuevo
 
     # ── implementación de cada consulta ───────────────────────────────────
-    def _capacidades(self, estacion, numero, desde):
+    def _capacidades(self, estacion, numero, mes_inicio, mes_fin):
         vivas = [
             r for r in self.registros.values()
             if r.estacion == estacion
             and r.numero == numero.replace(" ", "")
             and (r.synced or 0) != 1
             and r.produced < r.planned
+            and _fecha(mes_inicio) <= r.planned_date < _fecha(mes_fin)
             and (r.status == ord_sql.EN_PROGRESO
                  or (r.status in (ord_sql.PENDIENTE, ord_sql.DETENIDO)
-                     and r.orden is not None
-                     and r.planned_date >= _fecha(desde)))
+                     and r.orden is not None))
         ]
         vivas.sort(key=lambda r: (0 if r.status == ord_sql.EN_PROGRESO else 1,
                                   r.planned_date, r.shift, r.created_at, r.id))
@@ -152,16 +176,16 @@ class BaseFalsa:
         self._cambiar_status(r, ord_sql.EN_PROGRESO)
         return [(antes, r.produced, r.planned)]
 
-    def _sumar_a_no_planeado(self, piezas, fecha_plan, fecha, id_registro):
+    def _sumar_a_no_planeado(self, piezas, fecha_plan, fecha, id_registro, flavor):
         r = self.registros.get(id_registro)
         if (r is None or r.orden is not None
-                or r.status not in (ord_sql.EN_PROGRESO, ord_sql.NO_PLANEADO)):
+                or r.status not in (ord_sql.EN_PROGRESO, flavor)):
             return []
         r.produced += piezas
         r.planned_date = _fecha(fecha_plan)
-        # El CASE del SQL lee el status ANTERIOR: si venía cerrado, esta suma
-        # abre una corrida nueva y el inicio se mueve.
-        if r.status == ord_sql.NO_PLANEADO or r.production_start is None:
+        # El CASE del SQL lee el status ANTERIOR: si no estaba ya corriendo
+        # (venía cerrado, en 24 o en 14), esta suma abre una corrida nueva.
+        if r.status != ord_sql.EN_PROGRESO or r.production_start is None:
             r.production_start = fecha
         r.production_end = fecha
         self._cambiar_status(r, ord_sql.EN_PROGRESO)
@@ -179,8 +203,7 @@ class BaseFalsa:
         r = self.registros.get(id_registro)
         if r is None or r.status != ord_sql.EN_PROGRESO:
             return []
-        self._cambiar_status(
-            r, ord_sql.NO_PLANEADO if r.orden is None else ord_sql.DETENIDO)
+        self._cambiar_status(r, self._status_final(r))
         r.production_end = fecha
         return [(r.id,)]
 
@@ -188,20 +211,35 @@ class BaseFalsa:
         tocados = [r for r in self.registros.values()
                    if r.estacion == estacion and r.status == ord_sql.EN_PROGRESO]
         for r in tocados:
-            self._cambiar_status(
-                r, ord_sql.NO_PLANEADO if r.orden is None else ord_sql.DETENIDO)
+            self._cambiar_status(r, self._status_final(r))
             r.production_end = fecha
         return [(r.id,) for r in tocados]
 
-    def _buscar_no_planeado(self, estacion, numero, desde):
+    def _buscar_no_planeado(self, estacion, numero, flavor, mes_inicio, mes_fin):
         candidatos = [r for r in self.registros.values()
                       if r.estacion == estacion
                       and r.numero == numero.replace(" ", "")
-                      and r.status in (ord_sql.EN_PROGRESO, ord_sql.NO_PLANEADO)
                       and r.orden is None
-                      and r.planned_date >= _fecha(desde)]
+                      and r.status in (ord_sql.EN_PROGRESO, flavor)
+                      and _fecha(mes_inicio) <= r.planned_date < _fecha(mes_fin)]
         candidatos.sort(key=lambda r: r.id, reverse=True)
         return [(candidatos[0].id,)] if candidatos else []
+
+    def _buscar_vencido(self, estacion, numero, mes_inicio, mes_fin):
+        """Un acumulador vivo de un mes distinto: la corrida nunca "soltó" la
+        parte al cruzar de mes. Lo encuentra acumulador_no_planeado() antes
+        de crear el del mes actual, para cerrarlo con detener()."""
+        candidatos = [r for r in self.registros.values()
+                      if r.estacion == estacion
+                      and r.numero == numero.replace(" ", "")
+                      and r.orden is None
+                      and r.status == ord_sql.EN_PROGRESO
+                      and not (_fecha(mes_inicio) <= r.planned_date < _fecha(mes_fin))]
+        return [(candidatos[0].id,)] if candidatos else []
+
+    def _sync_from(self, estacion):
+        valor = self.sync_from.get(estacion)
+        return [(valor,)] if valor is not None else []
 
     def _corrida_en_progreso(self, estacion, numero):
         return [(r.id,) for r in self.registros.values()
@@ -253,6 +291,11 @@ class BaseFalsa:
     def no_planeados(self):
         """Solo los que ya quedaron en No planeado (corrida terminada)."""
         return [r for r in self.registros.values() if r.status == ord_sql.NO_PLANEADO]
+
+    @property
+    def no_verificados(self):
+        """Solo los que ya quedaron en No verificado (cuarentena, status 14)."""
+        return [r for r in self.registros.values() if r.status == ord_sql.NO_VERIFICADO]
 
     def reclamar_para_orden(self, id_registro, orden, piezas):
         """

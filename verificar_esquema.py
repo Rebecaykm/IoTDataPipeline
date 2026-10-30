@@ -45,7 +45,7 @@ COLUMNAS = {
 }
 
 ESTADOS = {3: "Pendiente", 4: "Completado", 7: "En progreso",
-           8: "Detenido", 24: "No planeado"}
+           8: "Detenido", 24: "No planeado", 14: "No verificado"}
 
 
 def conectar():

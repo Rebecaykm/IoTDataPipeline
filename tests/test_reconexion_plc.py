@@ -16,7 +16,7 @@ cuando la parte lleva tanto sin aparecer que su contador ya no dice nada.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -32,17 +32,29 @@ PARTE = "DGH97065ZA"
 OTRA = "DGH97066ZA"
 AREA = "Chasis"
 MOMENTO = datetime(2026, 9, 21, 12, 11, 0)
-CORTE = datetime(2026, 7, 3).date()
 
 
 @pytest.fixture(autouse=True)
-def corte_fijo(monkeypatch):
-    monkeypatch.setattr(Prensas, "ORDENES_DESDE", CORTE)
+def hoy_fijo(monkeypatch):
+    """
+    get_current_shift() calcula la fecha planificada con date.today(), sin
+    mirar la fecha del paquete simulado. Fijarla aquí la hace coincidir con
+    las órdenes de este archivo (2026-09-21), sin importar qué día sea
+    realmente cuando corren las pruebas.
+    """
+    class _FechaFija(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 9, 21)
+    monkeypatch.setattr(Prensas, "date", _FechaFija)
 
 
 @pytest.fixture
 def base():
-    return BaseFalsa([], partes=[(ESTACION, PARTE), (ESTACION, OTRA)])
+    """Con sync_from ya pasado: estas pruebas no tienen que ver con el régimen
+    de cuarentena, solo con la supervivencia de la línea base."""
+    return BaseFalsa([], partes=[(ESTACION, PARTE), (ESTACION, OTRA)],
+                     sync_from={ESTACION: date(2000, 1, 1)})
 
 
 @pytest.fixture

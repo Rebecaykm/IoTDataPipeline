@@ -7,7 +7,7 @@ parciales. Es el cableado —no la aritmética— lo que se está comprobando.
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
@@ -23,23 +23,33 @@ PARTE = "BDTS53411-BK"
 AREA = "Chasis"                       # el contador cuenta PIEZAS, no golpes
 MANANA = datetime(2026, 8, 19, 9, 0, 0)
 NOCHE = datetime(2026, 8, 19, 21, 30, 0)
-CORTE = datetime(2026, 7, 3).date()   # las órdenes de aquí son de agosto
 
 
 @pytest.fixture(autouse=True)
-def corte_fijo(monkeypatch):
+def hoy_fijo(monkeypatch):
     """
-    Fija la fecha de corte en vez de heredar la del .env de quien corra las
-    pruebas. Prensas lee ORDENES_DESDE al importarse: sin esto, adelantar esa
-    fecha en el .env deja las órdenes de estas pruebas fuera del corte y media
-    docena falla por algo que no tiene nada que ver con lo que prueban.
+    get_current_shift() calcula la fecha planificada con date.today(): solo
+    mira la HORA del paquete que se le pasa, nunca su fecha. Sin esto, las
+    pruebas dependerían de qué día sea realmente cuando corren -y con el
+    filtro de mes nuevo, dejarían de encontrar las órdenes que siembran con
+    fecha fija (2026-08-19) en cuanto cambiara el mes real.
     """
-    monkeypatch.setattr(Prensas, "ORDENES_DESDE", CORTE)
+    class _FechaFija(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 8, 19)
+    monkeypatch.setattr(Prensas, "date", _FechaFija)
 
 
 @pytest.fixture
 def base():
-    return BaseFalsa([], partes=[(ESTACION, PARTE)])
+    """
+    Con sync_from ya muy pasado por omisión: el grueso de estas pruebas no
+    tiene que ver con el régimen de cuarentena, solo con el llenado de
+    órdenes. TestRegimenPorEstacion reconfigura esto explícitamente.
+    """
+    return BaseFalsa([], partes=[(ESTACION, PARTE)],
+                     sync_from={ESTACION: date(2000, 1, 1)})
 
 
 @pytest.fixture
@@ -409,7 +419,8 @@ TROQUEL = "BDTS28BFC-P"
 def estampado(tmp_path, monkeypatch):
     """Un procesador de Estampado con 4 piezas por golpe."""
     base = BaseFalsa([], partes=[(PRENSA, TROQUEL)],
-                     multiplicadores={(PRENSA, TROQUEL): 4})
+                     multiplicadores={(PRENSA, TROQUEL): 4},
+                     sync_from={PRENSA: date(2000, 1, 1)})
     monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
     monkeypatch.setattr(Prensas, "create_connection", lambda: ConexionFalsa(base))
     monkeypatch.setattr(Prensas, "get_station_logger", lambda _e: LOG)
@@ -560,50 +571,67 @@ class TestCostoEnLaBase:
 
         assert len(base.consultas) == antes, "cinco ciclos sin producir, cero consultas"
 
-
-# ──────────────────────── fecha límite de órdenes ─────────────────────────
-
-class TestFechaLimiteDeOrdenes:
-    """
-    Hasta dónde hacia atrás se rescatan órdenes pendientes. Es una FECHA FIJA,
-    no una ventana móvil: el corte no debe recorrerse solo con el paso de los días.
-    """
-
-    def test_lee_la_fecha_del_entorno(self, monkeypatch):
-        monkeypatch.setenv("ORDENES_DESDE", "2026-07-03")
-        assert Prensas._fecha_limite_ordenes() == datetime(2026, 7, 3).date()
-
-    def test_es_fija_no_una_ventana_movil(self, monkeypatch):
+    def test_sync_from_no_se_consulta_si_nadie_produjo(self, procesador, base):
         """
-        El mismo valor de entorno da el mismo corte siempre. Con la ventana de
-        días anterior, el corte se recorría solo y un día dejaba de alcanzar
-        las órdenes que ayer sí alcanzaba.
+        El corte por estación se lee perezosamente: si ningún lado avanzó este
+        ciclo, no hay por qué ir a buscarlo.
         """
-        monkeypatch.setenv("ORDENES_DESDE", "2026-07-03")
-        assert Prensas._fecha_limite_ordenes() == Prensas._fecha_limite_ordenes()
-
-    @pytest.mark.parametrize("valor", ["", "   ", "03/07/2026", "2026-13-99", "ayer"])
-    def test_si_falta_o_viene_mal_usa_un_corte_permisivo(self, monkeypatch, valor):
-        """
-        Un corte demasiado reciente no dejaría alcanzar NINGUNA orden y toda la
-        producción se iría a No planeado sin que nadie se entere. Rescatar
-        órdenes viejas se ve y se corrige; perder el enlace con el plan, no.
-        """
-        monkeypatch.setenv("ORDENES_DESDE", valor)
-        assert Prensas._fecha_limite_ordenes() == Prensas.ORDENES_DESDE_DEFECTO
-        assert Prensas.ORDENES_DESDE_DEFECTO.year < 2020
-
-    def test_sin_la_variable_tampoco_truena(self, monkeypatch):
-        monkeypatch.delenv("ORDENES_DESDE", raising=False)
-        assert Prensas._fecha_limite_ordenes() == Prensas.ORDENES_DESDE_DEFECTO
-
-    def test_el_recolector_usa_esa_fecha_al_buscar_ordenes(self, procesador, base,
-                                                           monkeypatch):
-        """La fecha de corte llega tal cual a la consulta de capacidades."""
-        monkeypatch.setattr(Prensas, "ORDENES_DESDE", datetime(2026, 7, 3).date())
-        base.registros[101] = orden(101, "A", planned=900, fecha="2026-07-04")
-        base.registros[102] = orden(102, "VIEJA", planned=900, fecha="2026-07-02")
+        base.registros[101] = orden(101, "A", planned=900)
         procesar(procesador, [lectura(10)])
+        antes = len(base.consultas)
+        procesar(procesador, [lectura(10)])        # contador congelado
 
-        assert base[101].produced == 10, "la del 04-jul entra"
-        assert base[102].produced == 0, "la del 02-jul queda fuera del corte"
+        consultas_sync = [c for c in base.consultas[antes:]
+                          if "infor_sync_work_centers" in c]
+        assert consultas_sync == []
+
+
+# ──────────────────────── régimen por estación ────────────────────────────
+
+class TestRegimenPorEstacion:
+    """
+    El flavor del sobrante lo decide sync_from de la estación, leído fresco en
+    cada ciclo: sin fila, o con una fecha futura, cae en cuarentena (No
+    verificado); con una fecha ya pasada, en el flujo de siempre (No planeado).
+    """
+
+    def test_sin_sync_from_configurado_va_a_no_verificado(self, procesador, base):
+        base.sync_from.pop(ESTACION, None)
+        procesar(procesador, [lectura(9)])
+        procesar(procesador, [])                     # fin de la corrida
+
+        assert base.acumuladores[0].status == ord_sql.NO_VERIFICADO
+
+    def test_con_sync_from_ya_pasado_va_a_no_planeado(self, procesador, base):
+        base.sync_from[ESTACION] = date(2000, 1, 1)
+        procesar(procesador, [lectura(9)])
+        procesar(procesador, [])
+
+        assert base.acumuladores[0].status == ord_sql.NO_PLANEADO
+
+    def test_con_sync_from_futuro_va_a_no_verificado(self, procesador, base):
+        """La fecha de corte está configurada, pero todavía no se llega a ella."""
+        base.sync_from[ESTACION] = date(2099, 1, 1)
+        procesar(procesador, [lectura(9)])
+        procesar(procesador, [])
+
+        assert base.acumuladores[0].status == ord_sql.NO_VERIFICADO
+
+    def test_sync_from_se_lee_fresco_en_cada_ciclo(self, procesador, base):
+        """
+        Simula que alguien edita sync_from desde la interfaz web entre dos
+        corridas: el cambio surte efecto sin reiniciar el procesador.
+        """
+        base.sync_from.pop(ESTACION, None)
+        procesar(procesador, [lectura(5)])
+        procesar(procesador, [])
+        primero = base.acumuladores[0]
+        assert primero.status == ord_sql.NO_VERIFICADO
+
+        base.sync_from[ESTACION] = date(2000, 1, 1)      # lo configuran ahora
+        procesar(procesador, [lectura(4)])
+        procesar(procesador, [])
+        nuevos = [a for a in base.acumuladores if a.id != primero.id]
+
+        assert len(nuevos) == 1
+        assert nuevos[0].status == ord_sql.NO_PLANEADO

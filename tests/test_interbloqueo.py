@@ -12,7 +12,7 @@ ciclo se reintenta porque el propio motor lo pide ("Rerun the transaction").
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
 import pyodbc
 import pytest
@@ -28,7 +28,12 @@ ESTACION = "MK05"
 PARTE = "DGH97065ZA"
 AREA = "Chasis"
 MOMENTO = datetime(2026, 9, 21, 12, 0, 0)
-CORTE = datetime(2026, 7, 3).date()
+
+
+def base_con(registros=(), partes=None):
+    """BaseFalsa con sync_from ya pasado: estas pruebas no tienen que ver con
+    el régimen de cuarentena, solo con la supervivencia ante interbloqueos."""
+    return BaseFalsa(registros, partes=partes, sync_from={ESTACION: date(2000, 1, 1)})
 
 #: El error tal cual lo escupió el driver en producción.
 ERROR_REAL = (
@@ -69,8 +74,18 @@ class ConexionQueSeAtora(ConexionFalsa):
 
 
 @pytest.fixture(autouse=True)
-def corte_fijo(monkeypatch):
-    monkeypatch.setattr(Prensas, "ORDENES_DESDE", CORTE)
+def hoy_fijo(monkeypatch):
+    """
+    get_current_shift() calcula la fecha planificada con date.today(), sin
+    mirar la fecha del paquete simulado. Fijarla aquí la hace coincidir con
+    las órdenes de este archivo (2026-09-21), sin importar qué día sea
+    realmente cuando corren las pruebas.
+    """
+    class _FechaFija(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 9, 21)
+    monkeypatch.setattr(Prensas, "date", _FechaFija)
 
 
 def armar(monkeypatch, tmp_path, conexion):
@@ -121,8 +136,8 @@ class TestUnInterbloqueoNoCuestaProduccion:
     """Lo que de verdad importa: que las piezas acaben registradas."""
 
     def test_reintenta_y_la_produccion_queda(self, monkeypatch, tmp_path):
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=1)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -136,8 +151,8 @@ class TestUnInterbloqueoNoCuestaProduccion:
         El primer intento alcanzó a escribir antes de que lo mataran. Si el
         reintento sumara encima de eso, la orden quedaría con el doble.
         """
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=2)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -148,8 +163,8 @@ class TestUnInterbloqueoNoCuestaProduccion:
         assert len(base.histories) == 1, "una sola fila en histories, no tres"
 
     def test_la_segunda_lectura_sigue_contando_bien(self, monkeypatch, tmp_path):
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=1)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -166,8 +181,8 @@ class TestSiNoSePuedeLaLineaBaseNoSeMueve:
     """
 
     def test_no_queda_nada_escrito(self, monkeypatch, tmp_path):
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=99)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -176,8 +191,8 @@ class TestSiNoSePuedeLaLineaBaseNoSeMueve:
         assert base.historias == []
 
     def test_agota_los_intentos_y_no_mas(self, monkeypatch, tmp_path):
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=99)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -190,8 +205,8 @@ class TestSiNoSePuedeLaLineaBaseNoSeMueve:
         Esto es lo que se perdía: la línea base avanzaba a 8 aunque la base
         hubiera revertido, y esas 8 piezas no se volvían a intentar jamás.
         """
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=99)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -208,8 +223,8 @@ class TestSiNoSePuedeLaLineaBaseNoSeMueve:
         'contador congelado' hubiera avanzado, el ciclo siguiente saltaría esta
         parte por 'no ha cambiado nada' y las piezas se irían al olvido.
         """
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=99)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -226,8 +241,8 @@ class TestOtrosErroresNoSeReintentan:
         """
         Reintentar un fallo permanente solo multiplica el daño y llena el log.
         """
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
 
         class ConexionRota(ConexionFalsa):
             def __init__(self, base):
@@ -255,8 +270,8 @@ class TestElEstadoNoAvanzaSinCommit:
 
     def test_la_linea_base_en_memoria_se_queda_donde_estaba(
             self, monkeypatch, tmp_path):
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=99)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
@@ -272,8 +287,8 @@ class TestElEstadoNoAvanzaSinCommit:
         Sin rollback explícito, la conexión vuelve al pool con una transacción
         abortada y el siguiente que la tome hereda el problema.
         """
-        base = BaseFalsa([orden(101, "4051130", planned=900)],
-                         partes=[(ESTACION, PARTE)])
+        base = base_con([orden(101, "4051130", planned=900)],
+                       partes=[(ESTACION, PARTE)])
         conexion = ConexionQueSeAtora(base, fallos=99)
         procesador = armar(monkeypatch, tmp_path, conexion)
 
