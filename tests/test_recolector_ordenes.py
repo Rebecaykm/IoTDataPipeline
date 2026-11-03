@@ -546,7 +546,7 @@ class TestCostoEnLaBase:
         procesar(procesador, [lectura(20)])
         procesar(procesador, [lectura(30)])
 
-        consultas_pid = [c for c in base.consultas if "SELECT pn.id FROM part_numbers" in c]
+        consultas_pid = [c for c in base.consultas if "FROM part_numbers pn" in c]
         assert len(consultas_pid) == 1, "el id de la parte no cambia durante la corrida"
         assert base.conteo_en_histories() == 30, "y el historial sigue completo"
 

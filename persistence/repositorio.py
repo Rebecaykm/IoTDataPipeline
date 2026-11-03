@@ -19,9 +19,21 @@ def _sin_multiplicador(cursor, numero_parte, estacion, log):
 # ─────────────────────────────── part_numbers ──────────────────────────────
 
 def obtener_part_number_id(cursor, numero_parte, estacion):
-    sql = ("SELECT pn.id FROM part_numbers pn "
+    """
+    Id de la fila ACTIVA de part_numbers para este número+estación, o None.
+
+    Único punto de resolución de todo el repo: tanto el acumulador sin orden de
+    production_records (ver persistence/ordenes.py::acumulador_no_planeado) como
+    histories (ver Prensas.py) pasan por aquí. El catálogo puede tener más de una
+    fila con el mismo número bajo la misma estación —una vigente, otra dada de
+    baja— y sin este filtro cada quien podía resolver una distinta: así es como
+    production_records terminó con la activa e histories con la obsoleta para la
+    misma producción.
+    """
+    sql = ("SELECT TOP(1) pn.id FROM part_numbers pn "
            "JOIN work_centers wc ON pn.work_center_id = wc.id "
-           "WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=?")
+           "WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=? AND pn.is_obsolete = 0 "
+           "ORDER BY pn.id DESC")
     cursor.execute(sql, (numero_parte, estacion))
     res = cursor.fetchone()
     return res[0] if res else None

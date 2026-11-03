@@ -42,6 +42,7 @@ import logging
 from datetime import datetime
 
 from domain.ordenes import Capacidad, repartir
+from persistence.repositorio import obtener_part_number_id
 
 logger = logging.getLogger("supervisor")
 
@@ -383,10 +384,7 @@ INSERT INTO production_records
        (part_number_id, produced_quantity, shift_id, production_start,
         production_end, status_id, planned_date)
 OUTPUT INSERTED.id
-SELECT pn.id, 0, ?, ?, ?, {EN_PROGRESO}, ?
-FROM part_numbers pn
-JOIN work_centers wc ON pn.work_center_id = wc.id
-WHERE REPLACE(pn.number, ' ', '') = ? AND wc.name = ? AND pn.is_obsolete = 0
+VALUES (?, 0, ?, ?, ?, {EN_PROGRESO}, ?)
 """
 
 
@@ -436,14 +434,15 @@ def acumulador_no_planeado(cursor, estacion, numero_parte, fecha_plan,
         detener(cursor, vencido[0], fecha_fmt)
 
     try:
+        part_number_id = obtener_part_number_id(cursor, numero_parte, estacion)
+        if part_number_id is None:
+            log.warning(f"⚠️ No se pudo crear el acumulador: {numero_parte} no existe en {estacion}")
+            return None, "PART_NUMBER_NO_EXISTE_BD"
         cursor.execute(SQL_CREAR_NO_PLANEADO,
-                       (turno, fecha_fmt, fecha_fmt, fecha_plan, numero_parte, estacion))
+                       (part_number_id, turno, fecha_fmt, fecha_fmt, fecha_plan))
         fila = cursor.fetchone()
-        if fila:
-            log.info(f"🆕 Acumulador sin orden {fila[0]} para {numero_parte} en {estacion}")
-            return fila[0], None
-        log.warning(f"⚠️ No se pudo crear el acumulador: {numero_parte} no existe en {estacion}")
-        return None, "PART_NUMBER_NO_EXISTE_BD"
+        log.info(f"🆕 Acumulador sin orden {fila[0]} para {numero_parte} en {estacion}")
+        return fila[0], None
     except Exception as e:
         log.error(f"❌ Error creando acumulador para {numero_parte}: {e}")
         return None, "DB_ERROR"

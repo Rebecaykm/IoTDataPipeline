@@ -76,6 +76,12 @@ class BaseFalsa:
         self.histories = []          # filas tal como entrarían a la tabla
         self.consultas = []          # SQL lanzado, para contar viajes a la base
         self.transiciones = []       # [(id, status_antes, status_despues)]
+        #: {part_number_id falso: (estacion, numero)}, poblado por
+        #: _part_number_id(): simula que el id YA trae consigo a qué
+        #: estación+número pertenece (como en la BD real, vía FK), para que
+        #: _crear_no_planeado() —que ya solo recibe el id resuelto— sepa qué
+        #: registro construir.
+        self._ids_resueltos = {}
         self._filas = []
         self._siguiente_id = max([r.id for r in registros], default=0) + 1000
 
@@ -119,10 +125,10 @@ class BaseFalsa:
         if f"pr.status_id = {ord_sql.EN_PROGRESO}" in sql and "SELECT TOP(1)" in sql:
             return self._corrida_en_progreso(*p)
         if "INSERT INTO production_records" in sql:
-            return self._crear_no_planeado(p[0], p[3], p[4], p[5])
+            return self._crear_no_planeado(p[0], p[1], p[4])
         if "pieces_per_shot" in sql:
             return self._multiplicador(p[1], p[2])
-        if "SELECT pn.id FROM part_numbers" in sql:
+        if "FROM part_numbers pn" in sql:
             return self._part_number_id(p[1], p[0])
         if "INSERT INTO histories" in sql:
             return self._insertar_history(sql, p)
@@ -247,9 +253,11 @@ class BaseFalsa:
                 and r.numero == numero.replace(" ", "")
                 and r.status == ord_sql.EN_PROGRESO][:1]
 
-    def _crear_no_planeado(self, turno, fecha_plan, numero, estacion):
-        if (estacion, numero.replace(" ", "")) not in self.partes:
-            return []
+    def _crear_no_planeado(self, part_number_id, turno, fecha_plan):
+        # El id ya viene resuelto por obtener_part_number_id() (ver
+        # _part_number_id): si no existiera la parte, persistence/ordenes.py
+        # ni llega a ejecutar este INSERT.
+        estacion, numero = self._ids_resueltos[part_number_id]
         nuevo = Registro(self._siguiente_id, estacion, numero, orden=None,
                          planned=0, produced=0, status=ord_sql.EN_PROGRESO,
                          planned_date=fecha_plan, shift=turno)
@@ -266,7 +274,9 @@ class BaseFalsa:
         clave = (estacion, numero.replace(" ", ""))
         if clave not in self.partes:
             return []
-        return [(abs(hash(clave)) % 100000,)]
+        id_falso = abs(hash(clave)) % 100000
+        self._ids_resueltos[id_falso] = clave
+        return [(id_falso,)]
 
     def _insertar_history(self, sql, p):
         """Guarda la fila tal como quedaría en histories, con sus columnas."""

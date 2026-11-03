@@ -328,11 +328,25 @@ class TestAcumuladorNoPlaneado:
         assert len(cur) == 1, "no debe insertar si ya existe"
 
     def test_lo_crea_cuando_no_hay(self):
-        # 1) busca del mes actual -> nada. 2) busca vencido -> nada. 3) crea.
-        cur = CursorFalso([[], [], [(888,)]])
+        # 1) busca del mes actual -> nada. 2) busca vencido -> nada.
+        # 3) resuelve el part_number_id -> 123. 4) crea.
+        cur = CursorFalso([[], [], [(123,)], [(888,)]])
         assert ord_sql.acumulador_no_planeado(
             cur, "MK05", "X", HOY, 1, AHORA, log=LOG) == (888, None)
         assert "INSERT INTO production_records" in cur.sql
+        assert cur.params == (123, 1, AHORA, AHORA, HOY)
+
+    def test_resuelve_el_part_number_id_con_la_misma_funcion_que_histories(self):
+        """
+        Mismo punto único de resolución que usa Prensas.py para histories
+        (persistence.repositorio.obtener_part_number_id): así no puede volver
+        a pasar que production_records e histories terminen con un
+        part_number_id distinto para la misma producción.
+        """
+        cur = CursorFalso([[], [], [(123,)], [(888,)]])
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        assert "pn.is_obsolete = 0" in cur.sql_de(2)
+        assert cur.params_de(2) == ("X", "MK05")
 
     def test_nace_en_progreso_no_en_no_planeado(self):
         """
@@ -340,7 +354,7 @@ class TestAcumuladorNoPlaneado:
         quedaría ya cerrado si el INSERT prospera y la suma que viene detrás
         falla.
         """
-        cur = CursorFalso([[], [], [(888,)]])
+        cur = CursorFalso([[], [], [(123,)], [(888,)]])
         ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
         assert f", {ord_sql.EN_PROGRESO}, ?" in cur.sql
         assert f", {ord_sql.NO_PLANEADO}, ?" not in cur.sql
@@ -350,9 +364,9 @@ class TestAcumuladorNoPlaneado:
         Si naciera con la producción dentro, un reintento la duplicaría. Nace
         vacío y todo entra por sumar_a_no_planeado.
         """
-        cur = CursorFalso([[], [], [(888,)]])
+        cur = CursorFalso([[], [], [(123,)], [(888,)]])
         ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
-        assert "SELECT pn.id, 0, ?" in cur.sql
+        assert "VALUES (?, 0, ?" in cur.sql
 
     def test_busca_uno_solo_por_parte_y_estacion(self):
         """
@@ -401,8 +415,11 @@ class TestAcumuladorNoPlaneado:
                     raise RuntimeError("deadlock")
                 return super().execute(sql, params)
 
+        # 1) mes actual -> nada. 2) vencido -> nada. 3) resuelve el
+        # part_number_id -> 123 (para que SÍ se llegue a intentar el INSERT,
+        # que es donde se simula el error de base).
         id_reg, error = ord_sql.acumulador_no_planeado(
-            CursorRoto([[]]), "MK05", "X", HOY, 1, AHORA, log=LOG)
+            CursorRoto([[], [], [(123,)]]), "MK05", "X", HOY, 1, AHORA, log=LOG)
         assert (id_reg, error) == (None, "DB_ERROR")
 
 
@@ -415,8 +432,9 @@ class TestAcumuladorVencido:
 
     def test_lo_cierra_antes_de_crear_el_del_mes_nuevo(self):
         # 1) busca del mes actual -> nada. 2) busca vencido -> lo encuentra
-        # (id 555). 3) detener() lo cierra (UPDATE). 4) crea el del mes nuevo.
-        cur = CursorFalso([[], [(555,)], [], [(888,)]])
+        # (id 555). 3) detener() lo cierra (UPDATE). 4) resuelve el
+        # part_number_id -> 123. 5) crea el del mes nuevo.
+        cur = CursorFalso([[], [(555,)], [], [(123,)], [(888,)]])
         id_reg, error = ord_sql.acumulador_no_planeado(
             cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
         assert (id_reg, error) == (888, None)
@@ -424,9 +442,9 @@ class TestAcumuladorVencido:
         assert cur.params_de(2) == (AHORA, 555)   # el detener() sobre el vencido
 
     def test_sin_vencido_no_dispara_ningun_cierre_de_mas(self):
-        cur = CursorFalso([[], [], [(888,)]])
+        cur = CursorFalso([[], [], [(123,)], [(888,)]])
         ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
-        assert len(cur) == 3, "sin vencido no hay UPDATE de cierre de más"
+        assert len(cur) == 4, "sin vencido no hay UPDATE de cierre de más"
 
 
 class TestEstadosCoinciden:
