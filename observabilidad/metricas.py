@@ -58,6 +58,16 @@ resets_contador = Counter(
     "resets_contador_total", "Reinicios del contador del PLC detectados",
     ["estacion", "lado"],
 )
+linea_base_por_lado = Counter(
+    "linea_base_por_lado_total",
+    "Veces que la línea base se tomó del registro del lado porque la de la parte discrepaba",
+    ["estacion", "lado"],
+)
+piezas_fantasma_evitadas = Counter(
+    "piezas_fantasma_evitadas_total",
+    "Piezas que se habrían registrado de más al cambiar de número de parte",
+    ["estacion", "lado"],
+)
 ordenes_completadas = Counter(
     "ordenes_completadas_total", "Órdenes que llegaron a su cantidad planeada",
     ["estacion", "area"],

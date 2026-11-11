@@ -1074,6 +1074,10 @@ class IPDataProcessor:
     def __init__(self, ip):
         self.ip = ip
         self.active_records = {}
+        # Último contador visto por (ESTACIÓN, LADO), sin importar qué parte lo
+        # mostraba. El registro del PLC es del lado y lo comparten las partes que
+        # pasan por él; ver persistence/estado.py para por qué hace falta.
+        self.contadores_lado = {}
         self.last_scanned_parts = {}  # 🆕 Polling optimization cache
         self.state_file = STATE_DIR / f"state_{self.ip.replace('.', '_')}.json"
         self.load_state()
@@ -1081,17 +1085,52 @@ class IPDataProcessor:
     def load_state(self):
         """Carga el estado previo. La lectura vive en persistence/estado.py"""
         self.active_records = estado_store.cargar_estado(self.state_file, self.ip)
+        self.contadores_lado = estado_store.cargar_contadores_lado(
+            self.state_file, self.ip)
 
     def save_state(self):
         """Guarda el estado. La escritura atómica vive en persistence/estado.py"""
-        estado_store.guardar_estado(self.state_file, self.active_records, self.ip)
+        estado_store.guardar_estado(self.state_file, self.active_records, self.ip,
+                                    self.contadores_lado)
+
+    def _contador_del_lado(self, estacion, lado):
+        """
+        Último valor leído del registro de ese lado, o None si nunca se vio.
+
+        None NO es cero: significa "no hay observación", y quien pregunta debe
+        caer al comportamiento de siempre en vez de suponer que el registro
+        venía en 0, que inventaría una corrida nueva.
+        """
+        obs = self.contadores_lado.get(f"{estacion}_{lado}")
+        return obs.get('contador') if obs else None
+
+    def _anotar_contador_lado(self, estacion, lado, contador):
+        """
+        Deja constancia de en cuánto quedó el registro de ese lado.
+
+        Se llama SOLO desde lo diferido, junto con el avance de la línea base de
+        la parte: las dos tienen que moverse en el mismo commit. Si la
+        observación del lado avanzara y la línea base no —un interbloqueo, o una
+        parte que no tuvo dónde registrarse—, el próximo ciclo compararía contra
+        un registro ya avanzado y ese delta se perdería en silencio.
+        """
+        self.contadores_lado[f"{estacion}_{lado}"] = {
+            'contador': contador,
+            'visto_en': system_time.time(),
+        }
 
     def _linea_base_de_corrida(self, cursor, estacion, num, cnt, pipeline, log,
-                               corridas_previas):
+                               corridas_previas, contador_lado=None):
         """
         Desde qué valor del contador se empieza a contar una parte recién vista.
 
-        Sin estado previo, el contador del PLC admite dos lecturas y elegir mal
+        Si se sabe en cuánto venía el registro de ESE LADO, esa es la respuesta
+        y no hay que preguntar nada: el registro lo comparten las partes que
+        pasan por el lado, así que lo que marca ya está registrado a nombre de
+        quien lo produjo. Solo se cuenta lo que avance a partir de ahí.
+
+        Sin observación del lado —primer ciclo tras arrancar, o un lado que
+        nunca se ha leído— el contador del PLC admite dos lecturas y elegir mal
         cuesta producción real:
 
           - Ya había una orden EN PROGRESO: alguien venía contando y lo que
@@ -1099,6 +1138,10 @@ class IPDataProcessor:
             solo se registra lo que venga de aquí en adelante.
           - No había ninguna: es una corrida nueva, y lo que marca el contador
             es producción de esta corrida que todavía no está en ningún lado.
+
+        Esa segunda lectura es la que inflaba producción en cada cambio de
+        número: el registro todavía traía el sobrante de la parte que salía y se
+        daba por corrida nueva de la que entraba.
 
         `corridas_previas` memoriza la respuesta POR CICLO y es imprescindible:
         cuando LH y RH producen la misma parte, el primer lado en registrarse
@@ -1113,6 +1156,13 @@ class IPDataProcessor:
         except Exception as e:
             log.error(f"❌ No se pudo leer el multiplicador de {num} en {estacion}: {e}")
             mult = 1
+
+        if contador_lado is not None:
+            log.info(
+                f"🔗 {estacion}/{num}: el registro del lado venía en {contador_lado}, "
+                f"se cuenta desde ahí (mult={mult})."
+            )
+            return contador_lado, mult
 
         if num in corridas_previas:
             en_progreso = corridas_previas[num]
@@ -1389,9 +1439,19 @@ class IPDataProcessor:
                         clave = f"{estacion}_{num}_{lado_actual}"
                         reg = self.active_records.get(clave)
 
+                        # En cuánto venía el registro de ESTE LADO la lectura
+                        # pasada. Se lee del estado SIN TOCAR, porque las
+                        # actualizaciones van diferidas: así las varias partes que
+                        # comparten un lado —un troquel que saca cuatro números
+                        # por golpe— ven todas el mismo punto de partida dentro
+                        # del ciclo, en vez de que la primera se lleve el
+                        # incremento y las demás vean cero.
+                        prev_lado = self._contador_del_lado(estacion, lado_actual)
+
                         if reg is None:
                             base, mult = self._linea_base_de_corrida(
-                                cursor, estacion, num, cnt, pipeline, log, corridas_previas)
+                                cursor, estacion, num, cnt, pipeline, log, corridas_previas,
+                                contador_lado=prev_lado)
                             reg = {
                                 'contador_registro': base,
                                 'multiplicador': mult,
@@ -1406,7 +1466,44 @@ class IPDataProcessor:
                             self.active_records[clave] = reg
                             state_changed = True
 
-                        prev = reg.get('contador_registro', cnt)
+                        prev_parte = reg.get('contador_registro', cnt)
+
+                        # El registro es del LADO y lo comparten las partes que
+                        # pasan por él, así que cuando hay observación del lado
+                        # ESA es el punto de partida. Si coincide con la base de
+                        # la parte da lo mismo cuál se use; si discrepa, es que
+                        # otra parte estuvo contando en ese lado y la base de
+                        # esta ya no describe el registro — usarla registraría
+                        # como corrida nueva lo que la otra parte ya registró.
+                        prev = prev_lado if prev_lado is not None else prev_parte
+
+                        if prev_lado is not None and prev_lado != prev_parte:
+                            # Diagnóstico: cuántas piezas se habrían inflado.
+                            habria, _ = calcular_incremento(prev_parte, cnt)
+                            toca, _ = calcular_incremento(prev_lado, cnt)
+                            evitadas = max(habria - toca, 0)
+                            log.info(
+                                f"🔗 {estacion}/{num}/{lado_actual}: su base decía "
+                                f"{prev_parte} pero el registro del lado venía en "
+                                f"{prev_lado}. Se cuenta desde {prev_lado} "
+                                f"(evita {evitadas} pieza(s) de otra parte)."
+                            )
+                            try:
+                                obs_metricas.linea_base_por_lado.labels(
+                                    estacion, lado_actual).inc()
+                                if evitadas:
+                                    obs_metricas.piezas_fantasma_evitadas.labels(
+                                        estacion, lado_actual).inc(evitadas)
+                            except Exception:
+                                pass
+
+                            # Se realinea la base de la parte con el registro, o
+                            # el aviso se repetiría en cada ciclo mientras la
+                            # estación esté parada. Diferido como todo lo demás.
+                            def realinear(r=reg, c=prev_lado):
+                                r['contador_registro'] = c
+                            diferidos.append(realinear)
+                            state_changed = True
 
                         if cnt == prev:
                             # La prensa está parada; no es una falla.
@@ -1444,8 +1541,10 @@ class IPDataProcessor:
                                 pass
 
                         if incremento <= 0:
-                            def avanzar_sin_incremento(r=reg, c=cnt):
+                            def avanzar_sin_incremento(r=reg, c=cnt, est=estacion,
+                                                       lad=lado_actual):
                                 r['contador_registro'] = c
+                                self._anotar_contador_lado(est, lad, c)
                             diferidos.append(avanzar_sin_incremento)
                             state_changed = True
                             continue
@@ -1519,9 +1618,11 @@ class IPDataProcessor:
                                           numero_validado=num, contador=cnt, detalle=resultado.error)
                             continue
 
-                        def avanzar(r=reg, c=cnt, curso=resultado.en_curso):
+                        def avanzar(r=reg, c=cnt, curso=resultado.en_curso,
+                                    est=estacion, lad=lado_actual):
                             r['contador_registro'] = c
                             r['id_en_curso'] = curso
+                            self._anotar_contador_lado(est, lad, c)
                         diferidos.append(avanzar)
                         state_changed = True
 

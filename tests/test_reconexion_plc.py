@@ -145,6 +145,23 @@ class TestCuandoDesapareceSoloUnaParte:
     """La estación sigue reportando, pero una de sus partes ya no aparece."""
 
     def test_la_que_se_va_conserva_su_linea_base(self, procesador, base):
+        """
+        Hay UN contador por lado, no uno por parte: el tag se identifica por
+        tipo y lado ('Contador LH' en plc/decodificador.py::parse_tag) y nunca
+        por número, y areas/estampado.py lo dice para los troqueles de varias
+        piezas ("todos con el mismo contador").
+
+        Así que el recorrido del registro de este lado es 0→8 con PARTE, reinicio,
+        0→3 con OTRA, y 3→9 con PARTE otra vez: 17 piezas en total. Lo que se
+        reparte tiene que sumar eso mismo —8+6 para PARTE y 3 para OTRA— sin
+        duplicar ni perder nada.
+
+        Esta prueba esperaba 9 para PARTE, que sale de comparar el 9 contra su
+        línea base de 8 como si el registro fuera suyo. Tapaba las dos caras del
+        mismo error: cobraba de más cuando el sobrante era grande (3,393 piezas
+        fantasma en siete semanas de log de MM11) y de menos aquí, porque dejaba
+        5 piezas sin atribuir a nadie.
+        """
         base.registros[101] = orden(101, "4051130", planned=900)
 
         procesar(procesador, [lectura(8)])
@@ -153,7 +170,7 @@ class TestCuandoDesapareceSoloUnaParte:
 
         reg = procesador.active_records[clave()]
         assert reg['contador_registro'] == 9
-        assert base[101].produced == 9, "no se recontaron las 8"
+        assert base[101].produced == 14, "sus 8 de antes + el tramo 3→9"
 
 
 class TestElResetSigueFuncionando:
