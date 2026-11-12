@@ -11,11 +11,21 @@ y se BORRA su línea base → la parte vuelve → sin línea base se pregunta a 
 base si hay algo En progreso → pero acabamos de dejarlo en Detenido, así que la
 respuesta es no → "corrida nueva" → se cuenta el contador entero otra vez.
 
-Lo que se fija aquí: la línea base sobrevive a la ausencia. Solo se olvida
-cuando la parte lleva tanto sin aparecer que su contador ya no dice nada.
+Lo que se fija aquí: la línea base sobrevive a la ausencia.
+
+Antes, lo que sobrevivía era la ENTRADA de la parte, y solo se olvidaba cuando
+llevaba tanto sin aparecer que su contador ya no decía nada. Desde que el
+registro del lado se anota aunque la estación esté detenida (ver
+IPDataProcessor._anotar_contador_lado), es ESE dato el que sobrevive por su
+cuenta y no depende de ninguna ventana: en cuanto el lado queda protegido
+(ver _lado_protegido), la entrada de la parte se puede olvidar de inmediato
+sin perder nada. La ventana sigue existiendo, pero solo como red de
+seguridad para el lado que todavía no tiene observación propia.
 """
 
+import json
 import logging
+import time
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -111,24 +121,34 @@ class TestLaParteQueDesapareceYVuelve:
         assert base[101].produced == 11, "las 3 del hueco entran, las 8 no se repiten"
 
     def test_la_linea_base_sobrevive_a_la_ausencia(self, procesador, base):
+        """
+        Lo que sobrevive ya no es la ENTRADA de la parte: es el registro del
+        lado. La primera lectura ya deja contadores_lado["MK05_LH"] en 8 (se
+        anota en cada avance, ver _anotar_contador_lado), y con eso protegido
+        la entrada se puede olvidar de inmediato sin perder nada —si la parte
+        vuelve, _linea_base_de_corrida le da la base correcta desde el lado.
+        """
         base.registros[101] = orden(101, "4051130", planned=900)
 
         procesar(procesador, [lectura(8)])
         procesar(procesador, [])
 
-        reg = procesador.active_records.get(clave())
-        assert reg is not None, "el registro no se borra"
-        assert reg['contador_registro'] == 8
+        assert clave() not in procesador.active_records, "ya no hace falta conservarla"
+        assert procesador.contadores_lado[f"{ESTACION}_LH"]['contador'] == 8
 
     def test_la_orden_si_queda_detenida(self, procesador, base):
-        """Conservar la línea base no significa dejar la orden abierta."""
+        """
+        Olvidar la entrada de la parte no significa dejar la orden abierta:
+        se detiene igual, aunque ya no quede ningún registro vivo que marcar
+        como 'sin orden en curso' (ver test_la_linea_base_sobrevive_a_la_ausencia).
+        """
         base.registros[101] = orden(101, "4051130", planned=900)
 
         procesar(procesador, [lectura(8)])
         procesar(procesador, [])
 
         assert base[101].status == ord_sql.DETENIDO
-        assert procesador.active_records[clave()]['id_en_curso'] is None
+        assert clave() not in procesador.active_records
 
     def test_al_volver_retoma_la_orden_detenida(self, procesador, base):
         base.registros[101] = orden(101, "4051130", planned=900)
@@ -191,22 +211,16 @@ class TestElResetSigueFuncionando:
 
 class TestCuandoYaNoTieneSentidoRecordar:
     """
-    Una parte que lleva medio día sin aparecer ya no dice nada útil: su
-    contador puede haberse reiniciado veinte veces sin que nadie lo viera.
+    La ventana de doce horas solo sigue importando mientras el LADO no tiene
+    observación propia (ver IPDataProcessor._lado_protegido): protegido, la
+    entrada de la parte se olvida de inmediato (ver
+    TestLaParteQueDesapareceYVuelve.test_la_linea_base_sobrevive_a_la_ausencia)
+    y nada de lo de aquí abajo aplica.
+
+    El caso que sigue siendo real: justo después de migrar un archivo de
+    estado de antes de `lados` (ver persistence/estado.py), o cualquier
+    arranque donde ese lado todavía no se ha leído ni una vez.
     """
-
-    def test_se_olvida_despues_de_la_ventana(self, procesador, base):
-        base.registros[101] = orden(101, "4051130", planned=900)
-        procesar(procesador, [lectura(8)])
-
-        # Trece horas sin aparecer. La cifra es absoluta a propósito: medirla
-        # contra la propia constante haría que la prueba siguiera pasando
-        # aunque alguien estirara la ventana a un año.
-        procesador.active_records[clave()]['visto_en'] -= 13 * 3600
-
-        procesar(procesador, [])
-
-        assert clave() not in procesador.active_records
 
     def test_la_ventana_dura_un_turno_no_una_eternidad(self):
         """
@@ -216,43 +230,137 @@ class TestCuandoYaNoTieneSentidoRecordar:
         """
         assert 3600 <= Prensas.VENTANA_OLVIDO_LINEA_BASE <= 24 * 3600
 
-    def test_dentro_de_la_ventana_se_conserva(self, procesador, base):
-        base.registros[101] = orden(101, "4051130", planned=900)
-        procesar(procesador, [lectura(8)])
-
-        procesador.active_records[clave()]['visto_en'] -= 3600   # una hora
-
-        procesar(procesador, [])
-
-        assert clave() in procesador.active_records
-
-    def test_verla_de_nuevo_reinicia_la_cuenta_de_ausencia(self, procesador, base):
+    def _procesador_sin_observacion_del_lado(self, tmp_path, monkeypatch, base,
+                                             horas_de_ausencia):
         """
-        Una parte que lleva todo el turno produciendo no está ausente. Sin
-        refrescar la marca en cada lectura, bastaría un hueco del PLC al final
-        del turno para borrarle la línea base.
+        Arma un IPDataProcessor con la entrada de la parte ya en el archivo de
+        estado, pero SIN sección `lados` poblada: el escenario real de un
+        archivo escrito antes de este arreglo, o de un lado que nunca se ha
+        leído. Sin esa observación, _lado_protegido no tiene red que ofrecer y
+        el código cae en la ventana de siempre.
         """
-        base.registros[101] = orden(101, "4051130", planned=900)
-        procesar(procesador, [lectura(8)])
+        monkeypatch.setattr(Prensas, "create_connection", lambda: ConexionFalsa(base))
+        monkeypatch.setattr(Prensas, "get_station_logger", lambda _e: LOG)
+        monkeypatch.setattr(Prensas, "registrar_error_validacion", lambda *a, **k: None)
+        Prensas.REGISTRO.olvidar_estacion(ESTACION)
+        monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
 
-        procesador.active_records[clave()]['visto_en'] -= 13 * 3600
-        procesar(procesador, [lectura(9)])    # sigue ahí: la marca se refresca
-        procesar(procesador, [])              # ahora sí desaparece
+        state_file = tmp_path / f"state_{IP.replace('.', '_')}.json"
+        state_file.write_text(json.dumps({
+            "version": 2,
+            "partes": {
+                clave(): {
+                    "contador_registro": 8,
+                    "multiplicador": 1,
+                    "numero_original": PARTE,
+                    "lado": "LH",
+                    "id_en_curso": None,
+                    "visto_en": time.time() - horas_de_ausencia * 3600,
+                }
+            },
+            "lados": {},
+        }), encoding="utf-8")
 
-        assert clave() in procesador.active_records
+        proc = Prensas.IPDataProcessor(IP)
+        assert proc.contadores_lado == {}, "precondición: el lado sin observación"
+        return proc
 
-    def test_una_parte_recien_creada_no_se_olvida_de_inmediato(
-            self, procesador, base):
+    def test_sin_observacion_del_lado_se_conserva_dentro_de_la_ventana(
+            self, base, tmp_path, monkeypatch):
+        proc = self._procesador_sin_observacion_del_lado(
+            tmp_path, monkeypatch, base, horas_de_ausencia=1)
+
+        procesar(proc, [])
+
+        assert clave() in proc.active_records
+
+    def test_sin_observacion_del_lado_se_olvida_fuera_de_la_ventana(
+            self, base, tmp_path, monkeypatch):
+        # Trece horas sin aparecer. La cifra es absoluta a propósito: medirla
+        # contra la propia constante haría que la prueba siguiera pasando
+        # aunque alguien estirara la ventana a un año.
+        proc = self._procesador_sin_observacion_del_lado(
+            tmp_path, monkeypatch, base, horas_de_ausencia=13)
+
+        procesar(proc, [])
+
+        assert clave() not in proc.active_records
+
+
+class TestPurgaAlArrancar:
+    """
+    Una estación cuyo PLC deja de responder del todo nunca vuelve a pasar por
+    _process_estacion —no llega ningún paquete suyo—, así que ninguna de las
+    dos ventanas de arriba la alcanza. Sus partes se quedarían en el archivo
+    de estado para siempre. Esta purga corre una sola vez, al cargar el
+    estado, y es la única red para ese caso (ver VENTANA_PURGA_ARRANQUE).
+    """
+
+    def _escribir_estado(self, tmp_path, partes):
+        state_file = tmp_path / f"state_{IP.replace('.', '_')}.json"
+        state_file.write_text(json.dumps({
+            "version": 2,
+            "partes": partes,
+            "lados": {},
+        }), encoding="utf-8")
+        return state_file
+
+    def _entrada(self, horas_de_ausencia, parte=PARTE):
+        return {
+            "contador_registro": 8,
+            "multiplicador": 1,
+            "numero_original": parte,
+            "lado": "LH",
+            "id_en_curso": None,
+            "visto_en": time.time() - horas_de_ausencia * 3600,
+        }
+
+    def test_la_huerfana_de_mas_de_un_dia_se_olvida_al_arrancar(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
+        self._escribir_estado(tmp_path, {clave(): self._entrada(25)})
+
+        proc = Prensas.IPDataProcessor(IP)
+
+        assert clave() not in proc.active_records
+
+    def test_la_que_no_lleva_un_dia_sobrevive_al_arranque(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
+        self._escribir_estado(tmp_path, {clave(): self._entrada(20)})
+
+        proc = Prensas.IPDataProcessor(IP)
+
+        assert clave() in proc.active_records
+
+    def test_la_purga_no_toca_a_las_demas_partes_de_la_misma_estacion(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
+        clave_otra = clave(OTRA)
+        self._escribir_estado(tmp_path, {
+            clave(): self._entrada(25),
+            clave_otra: self._entrada(1, parte=OTRA),
+        })
+
+        proc = Prensas.IPDataProcessor(IP)
+
+        assert clave() not in proc.active_records
+        assert clave_otra in proc.active_records
+
+    def test_lo_purgado_queda_fuera_del_archivo_tras_guardarse(
+            self, tmp_path, monkeypatch):
         """
-        Aparece y desaparece en dos ciclos seguidos. Sin marca de tiempo propia
-        se daría por ausente desde 1970 y perdería la línea base recién puesta.
+        La purga no solo limpia la memoria: si no se guardara, el próximo
+        reinicio volvería a cargar la misma huérfana y repetiría el aviso
+        para siempre.
         """
-        base.registros[101] = orden(101, "4051130", planned=900)
+        monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
+        state_file = self._escribir_estado(tmp_path, {clave(): self._entrada(25)})
 
-        procesar(procesador, [lectura(8)])
-        procesar(procesador, [])
+        Prensas.IPDataProcessor(IP)
 
-        assert clave() in procesador.active_records
+        contenido = json.loads(state_file.read_text(encoding="utf-8"))
+        assert clave() not in contenido["partes"]
 
 
 class TestLecturaParcialSigueIntacta:

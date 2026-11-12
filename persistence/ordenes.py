@@ -594,7 +594,8 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
 
     regimen = "No planeado" if flavor == NO_PLANEADO else "No verificado"
     log.info(
-        f"📦 {piezas_sueltas} piezas de {numero_parte} en {estacion} sin orden: "
-        f"van al acumulador {id_acumulador} (régimen {regimen})."
+        f"📦 {piezas_sueltas} piezas de {numero_parte} en {estacion} sin orden "
+        f"(de un avance de {incremento} este ciclo): van al acumulador "
+        f"{id_acumulador} (régimen {regimen})."
     )
     return resultado

@@ -75,12 +75,22 @@ LOG_RESPALDOS = 7
 #: Intentos ante un interbloqueo de SQL Server. El propio motor lo pide:
 #: "Rerun the transaction". Darlo por perdido al primer intento cuesta la
 #: produccion de ese ciclo, porque la transaccion se revierte entera.
-#: Cuánto se conserva la línea base de una parte que dejó de aparecer.
-#: Una parte desaparece por dos razones muy distintas: el PLC se cayó unos
-#: segundos —y al volver hay que seguir contando donde se quedó— o la corrida
-#: terminó de verdad. Doce horas es un turno completo: cubre de sobra lo
-#: primero sin arrastrar contadores de ayer.
+#: Cuánto se conserva la línea base de una parte ausente CUANDO su lado
+#: todavía no tiene observación propia (ver IPDataProcessor._lado_protegido).
+#: Con observación, olvidarla es seguro de inmediato: el registro del lado le
+#: da la base correcta en cuanto la parte vuelva, sin esperar nada. Esta
+#: ventana solo cubre el caso sin esa red —un lado recién arrancado que aún no
+#: se ha leído, o uno cuyo PLC no responde—, así que sigue siendo un turno
+#: completo de margen.
 VENTANA_OLVIDO_LINEA_BASE = 12 * 3600   # segundos
+
+#: Cuánto se conserva una parte al ARRANCAR el servicio, sin importar nada más.
+#: Las dos ventanas de arriba solo corren dentro de _process_estacion, y esa
+#: función no se vuelve a llamar para una estación cuyo PLC dejó de mandar
+#: paquetes del todo: sus partes se quedarían en el archivo de estado para
+#: siempre. Esta purga corre una sola vez, al cargar el estado, y es la única
+#: red para ese caso.
+VENTANA_PURGA_ARRANQUE = 24 * 3600   # segundos
 
 BD_INTENTOS_INTERBLOQUEO = 3
 BD_ESPERA_REINTENTO = 0.25   # segundos, multiplicados por el numero de intento
@@ -1087,11 +1097,52 @@ class IPDataProcessor:
         self.active_records = estado_store.cargar_estado(self.state_file, self.ip)
         self.contadores_lado = estado_store.cargar_contadores_lado(
             self.state_file, self.ip)
+        self._purgar_huerfanas_al_arrancar()
 
     def save_state(self):
         """Guarda el estado. La escritura atómica vive en persistence/estado.py"""
         estado_store.guardar_estado(self.state_file, self.active_records, self.ip,
                                     self.contadores_lado)
+
+    def _purgar_huerfanas_al_arrancar(self):
+        """
+        Olvida, una sola vez al arrancar, las partes que lleven más de
+        VENTANA_PURGA_ARRANQUE sin aparecer.
+
+        _process_estacion solo limpia cuando llega un paquete de esa estación;
+        si su PLC dejó de responder del todo, eso nunca vuelve a pasar y sus
+        partes se quedarían en el archivo de estado para siempre. Esta es la
+        única red para ese caso, así que corre independientemente de si el
+        lado está protegido o no.
+        """
+        ahora_epoch = system_time.time()
+        huerfanas = [
+            clave for clave, reg in self.active_records.items()
+            if ahora_epoch - reg.get('visto_en', 0) > VENTANA_PURGA_ARRANQUE
+        ]
+        if not huerfanas:
+            return
+
+        for clave in huerfanas:
+            self.active_records.pop(clave, None)
+        logger.info(
+            f"🧹 {self.ip}: {len(huerfanas)} parte(s) sin aparecer hace más de "
+            f"{VENTANA_PURGA_ARRANQUE / 3600:.0f}h al arrancar, se olvidan: "
+            f"{', '.join(sorted(huerfanas))}"
+        )
+        self.save_state()
+
+    def _lado_protegido(self, estacion, lado):
+        """
+        True si ese lado ya tiene observación propia del registro.
+
+        Con ella, borrar la línea base de una parte ausente es seguro de
+        inmediato: si vuelve, _linea_base_de_corrida le da la base correcta
+        desde el registro del lado, sin necesidad de lo que esta parte tenía
+        guardado. Sin observación todavía no hay esa red, y hay que seguir
+        conservando la línea base con la ventana de siempre.
+        """
+        return self._contador_del_lado(estacion, lado) is not None
 
     def _contador_del_lado(self, estacion, lado):
         """
@@ -1158,10 +1209,16 @@ class IPDataProcessor:
             mult = 1
 
         if contador_lado is not None:
-            log.info(
-                f"🔗 {estacion}/{num}: el registro del lado venía en {contador_lado}, "
-                f"se cuenta desde ahí (mult={mult})."
-            )
+            if contador_lado:
+                log.info(
+                    f"🔗 {estacion}/{num}: el registro del lado NO se reinició, "
+                    f"viene en {contador_lado}; se cuenta desde ahí (mult={mult})."
+                )
+            else:
+                log.info(
+                    f"🔗 {estacion}/{num}: el registro del lado venía en 0, "
+                    f"corrida limpia (mult={mult})."
+                )
             return contador_lado, mult
 
         if num in corridas_previas:
@@ -1301,9 +1358,9 @@ class IPDataProcessor:
                         REGISTRO.anotar_estacion(estacion, obs_estado.ESTACION_SIN_PARTES)
                         ordenes.detener_estacion(cursor, estacion, fecha_fmt)
 
-                        # Igual que arriba: se cierra lo que quedó abierto, pero la
-                        # línea base se conserva. La estación que deja de reportar
-                        # casi siempre vuelve, y su contador no empezó de cero.
+                        # Se cierra lo que quedó abierto. La línea base se
+                        # conserva o no según el mismo criterio que el bucle de
+                        # obsoletas más abajo: ver _lado_protegido.
                         ahora_epoch = system_time.time()
                         for k in [k for k in self.active_records
                                   if k.startswith(f"{estacion}_")]:
@@ -1314,8 +1371,13 @@ class IPDataProcessor:
                                 diferidos.append(cerrar_de_estacion)
                                 state_changed = True
 
-                            ausente = ahora_epoch - reg_ausente.get('visto_en', 0)
-                            if ausente > VENTANA_OLVIDO_LINEA_BASE:
+                            if self._lado_protegido(estacion, reg_ausente.get('lado')):
+                                olvidar_ya = True
+                            else:
+                                ausente = ahora_epoch - reg_ausente.get('visto_en', 0)
+                                olvidar_ya = ausente > VENTANA_OLVIDO_LINEA_BASE
+
+                            if olvidar_ya:
                                 def olvidar_de_estacion(clave=k):
                                     self.active_records.pop(clave, None)
                                 diferidos.append(olvidar_de_estacion)
@@ -1356,7 +1418,11 @@ class IPDataProcessor:
                             if abierta:
                                 try:
                                     ordenes.detener(cursor, abierta, fecha_fmt)
-                                    log.info(f"⏹️ Corrida terminada en {k}: orden {abierta} Detenida.")
+                                    log.info(
+                                        f"⏹️ Corrida terminada en {k}: orden {abierta} "
+                                        f"Detenida. El registro quedó en "
+                                        f"{reg_ausente.get('contador_registro')}."
+                                    )
                                 except Exception as e:
                                     # El interbloqueo SÍ sube: lo atrapa el bucle de
                                     # reintentos. Lo demás se tolera como siempre.
@@ -1369,20 +1435,25 @@ class IPDataProcessor:
                                 diferidos.append(cerrar_la_ausente)
                                 state_changed = True
 
-                            # La LÍNEA BASE no se borra. Una parte desaparece de la
-                            # lectura cada vez que el PLC se cae unos segundos, y al
-                            # volver hay que seguir contando desde donde se quedó.
-                            # Borrarla hacía que el contador entero se registrara otra
-                            # vez como corrida nueva: producción duplicada.
-                            # Solo se olvida cuando lleva tanto ausente que su
-                            # contador ya no significa nada.
-                            ausente = ahora_epoch - reg_ausente.get('visto_en', 0)
-                            if ausente > VENTANA_OLVIDO_LINEA_BASE:
-                                log.info(
-                                    f"🧹 {k}: sin aparecer hace {ausente / 3600:.1f} h, "
-                                    f"se olvida su línea base."
-                                )
+                            # La línea base ya no necesita sobrevivir a ciegas:
+                            # con el lado protegido (ver _lado_protegido),
+                            # olvidarla de inmediato es seguro, porque si esta
+                            # parte vuelve el registro del lado le da la base
+                            # correcta sin esperar nada. Sin esa observación
+                            # todavía, se conserva con la ventana de siempre.
+                            if self._lado_protegido(estacion, reg_ausente.get('lado')):
+                                log.info(f"🧹 {k}: su lado ya está protegido, se olvida de inmediato.")
+                                olvidar_ya = True
+                            else:
+                                ausente = ahora_epoch - reg_ausente.get('visto_en', 0)
+                                olvidar_ya = ausente > VENTANA_OLVIDO_LINEA_BASE
+                                if olvidar_ya:
+                                    log.info(
+                                        f"🧹 {k}: sin aparecer hace {ausente / 3600:.1f} h "
+                                        f"y su lado sin observación, se olvida su línea base."
+                                    )
 
+                            if olvidar_ya:
                                 def olvidar(clave=k):
                                     self.active_records.pop(clave, None)
                                 diferidos.append(olvidar)
