@@ -305,13 +305,13 @@ class TestPurgaAlArrancar:
         }), encoding="utf-8")
         return state_file
 
-    def _entrada(self, horas_de_ausencia, parte=PARTE):
+    def _entrada(self, horas_de_ausencia, parte=PARTE, id_en_curso=None):
         return {
             "contador_registro": 8,
             "multiplicador": 1,
             "numero_original": parte,
             "lado": "LH",
-            "id_en_curso": None,
+            "id_en_curso": id_en_curso,
             "visto_en": time.time() - horas_de_ausencia * 3600,
         }
 
@@ -332,6 +332,24 @@ class TestPurgaAlArrancar:
         proc = Prensas.IPDataProcessor(IP)
 
         assert clave() in proc.active_records
+
+    def test_la_huerfana_con_orden_abierta_no_se_toca(self, tmp_path, monkeypatch):
+        """
+        El caso real encontrado en el state_cache de MK05: una parte lleva más
+        de un día sin aparecer, pero todavía tiene una orden EN_PROGRESO
+        (id_en_curso). Este método no tiene cursor para detenerla —olvidar la
+        entrada de todos modos dejaría esa orden varada en EN_PROGRESO sin que
+        nadie se entere—, así que se queda intacta para revisión manual.
+        """
+        monkeypatch.setattr(Prensas, "STATE_DIR", tmp_path)
+        self._escribir_estado(tmp_path, {
+            clave(): self._entrada(25, id_en_curso=339660),
+        })
+
+        proc = Prensas.IPDataProcessor(IP)
+
+        assert clave() in proc.active_records
+        assert proc.active_records[clave()]['id_en_curso'] == 339660
 
     def test_la_purga_no_toca_a_las_demas_partes_de_la_misma_estacion(
             self, tmp_path, monkeypatch):

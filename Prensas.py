@@ -1107,22 +1107,44 @@ class IPDataProcessor:
     def _purgar_huerfanas_al_arrancar(self):
         """
         Olvida, una sola vez al arrancar, las partes que lleven más de
-        VENTANA_PURGA_ARRANQUE sin aparecer.
+        VENTANA_PURGA_ARRANQUE sin aparecer y SIN una orden abierta.
 
         _process_estacion solo limpia cuando llega un paquete de esa estación;
         si su PLC dejó de responder del todo, eso nunca vuelve a pasar y sus
         partes se quedarían en el archivo de estado para siempre. Esta es la
         única red para ese caso, así que corre independientemente de si el
         lado está protegido o no.
+
+        Si la entrada tiene `id_en_curso`, NO se toca: este método solo lee
+        el archivo, sin cursor ni conexión a BD, así que no puede detener esa
+        orden como hace _process_estacion. Olvidar la entrada de todos modos
+        dejaría la orden en EN_PROGRESO para siempre sin que nadie se entere
+        —justo lo que no se debe hacer—, así que se avisa y se deja intacta
+        para que alguien la revise a mano.
         """
         ahora_epoch = system_time.time()
-        huerfanas = [
-            clave for clave, reg in self.active_records.items()
+        vencidas = [
+            (clave, reg) for clave, reg in self.active_records.items()
             if ahora_epoch - reg.get('visto_en', 0) > VENTANA_PURGA_ARRANQUE
         ]
-        if not huerfanas:
+        if not vencidas:
             return
 
+        huerfanas = [clave for clave, reg in vencidas if reg.get('id_en_curso') is None]
+        con_orden_abierta = [(clave, reg['id_en_curso']) for clave, reg in vencidas
+                              if reg.get('id_en_curso') is not None]
+
+        if con_orden_abierta:
+            logger.warning(
+                f"⚠️ {self.ip}: {len(con_orden_abierta)} parte(s) sin aparecer hace más "
+                f"de {VENTANA_PURGA_ARRANQUE / 3600:.0f}h con una orden todavía abierta; "
+                f"no se olvidan solas, revisar a mano: " +
+                ", ".join(f"{clave} (orden {orden})"
+                          for clave, orden in sorted(con_orden_abierta))
+            )
+
+        if not huerfanas:
+            return
         for clave in huerfanas:
             self.active_records.pop(clave, None)
         logger.info(
