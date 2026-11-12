@@ -135,9 +135,30 @@ RECHAZOS = RechazosStore(CSV_DIR / "parts_not_found.jsonl")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "9100"))
 
 #  CONFIGURACIÓN GLOBAL DE CONEXIÓN PLC
-PLC_CONNECTION_TIMEOUT = 15  # 5 segundos de timeout
-PLC_READ_TIMEOUT = 10        # 3 segundos para lectura
-RECONNECT_DELAY = 10        # 10 segundos entre reconexiones fallidas
+PLC_CONNECTION_TIMEOUT = 15   # segundos para el connect() inicial
+
+#: Segundos que se le dan al PLC para responder una lectura. Se pasa a
+#: Type3E.setaccessopt(timer_sec=...), que es quien sabe traducirlo: el PLC
+#: recibe timer_sec*4 en unidades de 250ms (su propio aviso de "ya me tardé"),
+#: y el socket espera timer_sec+1 —un segundo más, el margen que pide la
+#: propia librería para que esa respuesta de timeout le dé tiempo de llegar.
+#: Antes los dos se igualaban al mismo número crudo (plc.timer=10,
+#: plc.soc_timeout=10): el PLC avisaba a los 2.5s pero el socket seguía
+#: esperando hasta los 10, así que ese aviso nunca llegaba a tiempo de nada.
+PLC_READ_TIMEOUT_SEC = 3
+
+#: Cuántas veces se reintenta una lectura que dio timeout ANTES de cerrar el
+#: socket y reconectar. Un timeout aislado no significa que la conexión esté
+#: mal —solo que esa vuelta no llegó—, y reconectar completo cuesta hasta
+#: PLC_CONNECTION_TIMEOUT segundos más que un reintento sobre el mismo socket.
+MAX_REINTENTOS_LECTURA = 2
+
+#: Espera entre reconexiones fallidas: arranca aquí y se DUPLICA en cada
+#: fallo sucesivo (ver plc_reader), hasta el tope de abajo. Antes era fija:
+#: con el PLC realmente caído, martillar cada 10s para siempre no acelera
+#: nada y solo llena el log. Se reinicia en cuanto una conexión prospera.
+RECONNECT_DELAY = 10
+RECONNECT_DELAY_MAX = 60
 
 # ═══════════════════════════ POOLS DE HILOS (I/O BLOQUEANTE) ═══════════════════════════
 # pymcprotocol y pyodbc son bloqueantes: si se llaman directo desde una corrutina
@@ -1866,17 +1887,19 @@ async def plc_reader(ip, port, group_info):
         plc = Type3E()
         plc.network = 0
         plc.pc = 0xFF
-        plc.timer = PLC_READ_TIMEOUT
-        try:
-            plc.soc_timeout = PLC_READ_TIMEOUT
-        except:
-            pass
+        # setaccessopt toma segundos y deriva timer (250ms) y soc_timeout
+        # (timer_sec + 1) correctamente — ver PLC_READ_TIMEOUT_SEC.
+        plc.setaccessopt(timer_sec=PLC_READ_TIMEOUT_SEC)
         return plc
 
     plc = create_plc_instance()
     connected = False
     consecutive_failures = 0
     max_consecutive_failures = 3
+
+    # Timeouts de LECTURA (no de conexión): cuántos van sin cerrar el socket
+    # todavía. Se reinicia en cada lectura buena y en cada reconexión nueva.
+    intentos_lectura = 0
 
     #  NUEVO: Intervalo de lectura más inteligente
     last_read_time = datetime.now()
@@ -1940,8 +1963,17 @@ async def plc_reader(ip, port, group_info):
                     for _est in group_info.get('estaciones', []):
                         REGISTRO.anotar_estacion(_est, obs_estado.PLC_DESCONECTADO)
                     if consecutive_failures >= max_consecutive_failures:
-                        logger.error(f"❌ Múltiples fallos de conexión con PLC {ip}, esperando {RECONNECT_DELAY}s")
-                        await asyncio.sleep(RECONNECT_DELAY)
+                        # Escalonado: se duplica por cada fallo de más allá del
+                        # umbral, con tope. Machacar cada RECONNECT_DELAY fijo
+                        # mientras el PLC está realmente caído no lo revive más
+                        # rápido y solo llena el log sin decir nada nuevo.
+                        de_mas = consecutive_failures - max_consecutive_failures
+                        espera = min(RECONNECT_DELAY * (2 ** de_mas), RECONNECT_DELAY_MAX)
+                        logger.error(
+                            f"❌ {consecutive_failures} fallos consecutivos de conexión "
+                            f"con PLC {ip}, esperando {espera}s"
+                        )
+                        await asyncio.sleep(espera)
                     else:
                         await asyncio.sleep(2)  # Espera corta entre intentos
                     continue
@@ -1955,6 +1987,7 @@ async def plc_reader(ip, port, group_info):
                     # Leer datos
                     await collector.collect_and_enqueue(plc, group_info)
                     last_read_time = current_time
+                    intentos_lectura = 0
                     try:
                         obs_metricas.plc_lecturas.labels(ip, "ok").inc()
                         obs_metricas.plc_ultima_lectura.labels(ip).set(current_time.timestamp())
@@ -1974,13 +2007,28 @@ async def plc_reader(ip, port, group_info):
                         pass
 
                     if "timed out" in err_str and winerr is None:
-                        logger.warning(f"⏱️ Timeout leyendo PLC {ip} — cerrando socket y reconectando (delay corto)...")
-                        try: plc.close()
-                        except Exception: pass
-                        connected = False
-                        plc = create_plc_instance()
-                        await asyncio.sleep(2)
-                        
+                        intentos_lectura += 1
+                        if intentos_lectura <= MAX_REINTENTOS_LECTURA:
+                            # Un timeout aislado no dice que la conexión esté
+                            # mal: se reintenta sobre el MISMO socket antes de
+                            # pagar el costo de una reconexión completa.
+                            logger.warning(
+                                f"⏱️ Timeout leyendo PLC {ip} (intento "
+                                f"{intentos_lectura}/{MAX_REINTENTOS_LECTURA}), "
+                                f"reintento sin cerrar el socket..."
+                            )
+                            await asyncio.sleep(1)
+                        else:
+                            logger.warning(
+                                f"⏱️ Timeout leyendo PLC {ip} tras {intentos_lectura} "
+                                f"intentos — cerrando socket y reconectando..."
+                            )
+                            try: plc.close()
+                            except Exception: pass
+                            connected = False
+                            plc = create_plc_instance()
+                            intentos_lectura = 0
+                            await asyncio.sleep(2)
 
                     # WinError reales: requieren cierre de socket y reconexión completa
                     elif winerr == 10054:
@@ -1989,6 +2037,7 @@ async def plc_reader(ip, port, group_info):
                         except Exception: pass
                         connected = False
                         plc = create_plc_instance()
+                        intentos_lectura = 0
                         await asyncio.sleep(RECONNECT_DELAY)
                     elif winerr == 10061:
                         logger.warning(f"🔌 WinError 10061 – PLC {ip} rechazó la lectura (Connection Refused). Reconectando...")
@@ -1996,6 +2045,7 @@ async def plc_reader(ip, port, group_info):
                         except Exception: pass
                         connected = False
                         plc = create_plc_instance()
+                        intentos_lectura = 0
                         await asyncio.sleep(RECONNECT_DELAY)
                     else:
                         logger.error(f"⚠️ OSError [{winerr}] en lectura PLC {ip}: {err_str[:120]}")
@@ -2003,6 +2053,7 @@ async def plc_reader(ip, port, group_info):
                         except Exception: pass
                         connected = False
                         plc = create_plc_instance()
+                        intentos_lectura = 0
                         await asyncio.sleep(RECONNECT_DELAY)
                 except Exception as read_error:
                     logger.error(f"❌ Error en lectura PLC {ip}: {str(read_error)[:100]}")
@@ -2011,6 +2062,7 @@ async def plc_reader(ip, port, group_info):
                     except Exception:
                         pass
                     connected = False
+                    intentos_lectura = 0
                     plc = create_plc_instance()  # Recrear instancia
                     await asyncio.sleep(1)
 
