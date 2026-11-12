@@ -206,6 +206,10 @@ class TestLoQueSigueIgual:
         Primer ciclo tras arrancar: sin observación del lado se decide como
         siempre, preguntando a la base. Lo que marca el contador ya está
         registrado y no se vuelve a cobrar.
+
+        La prensa queda DETENIDA en ese mismo ciclo (el contador no se movió),
+        pero el lado tiene que quedar observado de todos modos: si no, sigue
+        sin protección mientras no llegue un golpe (ver TestLadoDetenidoDesdeElArranque).
         """
         base.registros[101] = orden(101, "4051130", A, planned=900, produced=300,
                                     status=ord_sql.EN_PROGRESO)
@@ -213,6 +217,31 @@ class TestLoQueSigueIgual:
         procesar(procesador, [lectura(300, A)])
 
         assert base[101].produced == 300, "ya estaba contado"
+        assert procesador.contadores_lado[f"{ESTACION}_RH"]["contador"] == 300
+
+    def test_detenida_desde_el_arranque_no_necesita_avanzar_para_quedar_protegida(
+            self, procesador, base):
+        """
+        El hueco real: antes de este arreglo, un lado sin observación se
+        comportaba como el código viejo HASTA su primer avance (ver
+        _anotar_contador_lado). Si la prensa estaba detenida desde que arrancó
+        el recolector, ese avance podía no llegar nunca, y un cambio de número
+        de parte en ese tramo volvía a inflarse —exactamente el fantasma que
+        este archivo arregla, reaparecido por otra puerta.
+
+        Aquí A llega ya EN_PROGRESO y detenida: el registro se observa en el
+        primer ciclo sin que haga falta ni un golpe. B entra después leyendo el
+        mismo valor (el registro no se movió) y no se le cuenta nada.
+        """
+        base.registros[101] = orden(101, "4051130", A, planned=900, produced=180,
+                                    status=ord_sql.EN_PROGRESO)
+        base.registros[201] = orden(201, "4051131", B, planned=900)
+
+        procesar(procesador, [lectura(180, A)])      # detenida: se observa sin avanzar
+        procesar(procesador, [lectura(180, B)])      # cambia de parte, el registro no se movió
+
+        assert base[101].produced == 180
+        assert base[201].produced == 0, "nada fantasma: el registro nunca avanzó"
 
     def test_un_interbloqueo_no_adelanta_la_observacion_del_lado(
             self, base, tmp_path, monkeypatch):

@@ -1510,6 +1510,26 @@ class IPDataProcessor:
                             anotar_estado(estacion, lado_actual, obs_estado.CONTADOR_DETENIDO,
                                           area=area, ip=self.ip, numero_plc=num_orig,
                                           numero_validado=num, contador=cnt)
+
+                            # Sin esto, un lado que arranca detenido (recién
+                            # desplegado el servicio, o uno que simplemente no
+                            # ha producido todavía) se queda SIN observación
+                            # mientras no avance — y mientras no la tiene se
+                            # comporta como el código de antes de este arreglo
+                            # (ver _linea_base_de_corrida): un cambio de número
+                            # de parte en ese tramo vuelve a contarse de más.
+                            # Anotarlo también aquí cierra el hueco en un ciclo
+                            # en vez de esperar al primer golpe.
+                            if prev_lado is None:
+                                log.info(
+                                    f"🔒 {estacion}/{lado_actual}: primera observación "
+                                    f"del registro tras el arranque ({cnt}). Queda protegido."
+                                )
+
+                                def anotar_lado_detenido(est=estacion, lad=lado_actual, c=cnt):
+                                    self._anotar_contador_lado(est, lad, c)
+                                diferidos.append(anotar_lado_detenido)
+                                state_changed = True
                             continue
 
                         incremento, hubo_reset = calcular_incremento(prev, cnt)
