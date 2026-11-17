@@ -204,3 +204,54 @@ class TestElLectorSueltaLaConexionAlTerminar:
 
         assert "connect" in eventos
         assert eventos[-1] == "close", eventos
+
+    def test_tras_un_timeout_no_se_vuelve_a_leer_en_el_mismo_socket(self, monkeypatch):
+        """
+        El caso de Estampado del 12 al 17 de noviembre de 2026: tras un timeout
+        se reintentaba en el mismo socket, la respuesta tardía se tomaba como
+        la de la petición siguiente y el contador recibía el número de parte
+        (la 2500T leyó "DG" = 18,244). Ahora se abre una conexión nueva antes
+        de volver a leer.
+        """
+        eventos = []
+
+        class ClienteFalso:
+            def setaccessopt(self, **_):
+                pass
+
+            def connect(self, ip, port):
+                eventos.append("connect")
+
+            def close(self):
+                eventos.append("close")
+
+            def batchread_wordunits(self, headdevice, readsize):
+                eventos.append("lee")
+                if eventos.count("lee") == 1:
+                    raise TimeoutError("timed out")
+                return [0] * readsize
+
+        monkeypatch.setattr(Prensas, "ClienteMC", ClienteFalso)
+        monkeypatch.setattr(Prensas, "ip_data_queues", {})
+        monkeypatch.setattr(Prensas, "get_station_logger", lambda _e: logging.getLogger("test"))
+        info = {"estaciones": [], "all_addresses": {("D100", 1)}, "station_configs": {},
+                "area": "Estampado", "port": 5002, "_version": 1}
+
+        async def leer_dos_veces():
+            lector = asyncio.create_task(Prensas.plc_reader("10.9.9.9", 5002, info))
+            for _ in range(100):
+                if eventos.count("lee") >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            lector.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await lector
+
+        asyncio.run(leer_dos_veces())
+
+        primera = eventos.index("lee")
+        segunda = eventos.index("lee", primera + 1)
+        entre = eventos[primera + 1:segunda]
+        assert entre and entre[0] == "close" and entre[-1] == "connect", (
+            "cerrar la conexión del timeout y abrir otra antes de volver a leer: "
+            f"{eventos}")
