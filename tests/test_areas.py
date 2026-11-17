@@ -70,8 +70,9 @@ class TestAreaGeneral:
     def test_no_agrega_columnas_extra(self):
         assert AreaPipeline().extras_history({"troquel_id": 215}) == {}
 
-    def test_requiere_validacion_contra_part_numbers(self):
-        assert AreaPipeline().requiere_validacion_bd() is True
+    def test_no_consulta_el_catalogo_para_traducir(self):
+        """Expandir por '/' es puro: no hace falta sacarlo del hilo de los PLC."""
+        assert AreaPipeline().resuelve_en_catalogo is False
 
 
 class TestEstampado:
@@ -124,8 +125,9 @@ class TestEstampado:
     def test_sin_troquel_va_cero(self):
         assert EstampadoPipeline().extras_history({}) == {"sequence": 0}
 
-    def test_no_revalida_contra_part_numbers(self):
-        assert EstampadoPipeline().requiere_validacion_bd() is False
+    def test_traducir_el_mdi_consulta_el_catalogo(self):
+        """El colector lo usa para no bloquear la lectura de los PLC con la base."""
+        assert EstampadoPipeline().resuelve_en_catalogo is True
 
 
 class TestNumerosSinEspacios:

@@ -1,6 +1,4 @@
-import datetime
 import time as system_time
-from pymcprotocol import Type3E
 from datetime import datetime, time, timedelta, date
 from collections import defaultdict
 import asyncio, hashlib, pyodbc
@@ -9,16 +7,14 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Dict, Tuple
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import re
-import json
 import traceback
 from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
 
-# CustomTkinter para la nueva UI
 import signal
 
 # Lógica de negocio pura (sin PLC ni BD). Ver domain/__init__.py
@@ -30,6 +26,7 @@ from areas import obtener_pipeline, ContextoArea
 
 # Decodificación de lo que manda el PLC. Ver plc/
 from plc.decodificador import decodificar_bloque, parse_tag
+from plc.cliente import ClienteMC
 
 # Observabilidad: estado clasificado, métricas y servidor HTTP. Ver observabilidad/
 from observabilidad import estado as obs_estado
@@ -45,6 +42,7 @@ from persistence import repositorio as repo
 from persistence import ordenes
 from persistence import estado as estado_store
 from persistence import catalogo
+from persistence.errores import es_interbloqueo
 from persistence.repositorio import obtener_part_number_id
 
 # ═══════════════════════════ CONFIGURACIÓN GLOBAL ═══════════════════════════
@@ -60,8 +58,8 @@ CSV_DIR.mkdir(exist_ok=True)
 STATE_DIR = Path("state_cache")
 STATE_DIR.mkdir(exist_ok=True)
 
-# Configurar logging CON ROTACIÓN
-logging.basicConfig(level=logging.NOTSET, handlers=[])
+# Los manejadores (archivo y consola) se ponen en configurar_logging(), al
+# arrancar el servicio: no al importar este módulo.
 logger = logging.getLogger("supervisor")
 logger.setLevel(logging.INFO)
 logger.propagate = False
@@ -72,9 +70,6 @@ logger.propagate = False
 LOG_MAX_BYTES = 10 * 1024 * 1024
 LOG_RESPALDOS = 7
 
-#: Intentos ante un interbloqueo de SQL Server. El propio motor lo pide:
-#: "Rerun the transaction". Darlo por perdido al primer intento cuesta la
-#: produccion de ese ciclo, porque la transaccion se revierte entera.
 #: Cuánto se conserva la línea base de una parte ausente CUANDO su lado
 #: todavía no tiene observación propia (ver IPDataProcessor._lado_protegido).
 #: Con observación, olvidarla es seguro de inmediato: el registro del lado le
@@ -92,44 +87,47 @@ VENTANA_OLVIDO_LINEA_BASE = 12 * 3600   # segundos
 #: red para ese caso.
 VENTANA_PURGA_ARRANQUE = 24 * 3600   # segundos
 
+#: Intentos ante un interbloqueo de SQL Server. El propio motor lo pide:
+#: "Rerun the transaction". Darlo por perdido al primer intento cuesta la
+#: producción de ese ciclo, porque la transacción se revierte entera.
 BD_INTENTOS_INTERBLOQUEO = 3
-BD_ESPERA_REINTENTO = 0.25   # segundos, multiplicados por el numero de intento
+BD_ESPERA_REINTENTO = 0.25   # segundos, multiplicados por el número de intento
+
+FORMATO_LOG = '%(asctime)s - %(levelname)s - %(message)s'
 
 
-def es_interbloqueo(e) -> bool:
-    """Si SQL Server eligio esta transaccion como victima de un interbloqueo."""
-    if isinstance(e, pyodbc.Error) and e.args and e.args[0] == '40001':
-        return True
-    texto = str(e)
-    return '1205' in texto and 'deadlock' in texto.lower()
+def configurar_logging():
+    """
+    Log del supervisor a logs/supervisor.log (con rotación) y a la consola.
 
-# 🔄 Handler con rotación para el logger principal
-supervisor_log_path = LOGS_DIR / "supervisor.log"
-supervisor_file_handler = RotatingFileHandler(
-    supervisor_log_path,
-    mode='a',
-    encoding='utf-8',
-    maxBytes=LOG_MAX_BYTES,
-    backupCount=LOG_RESPALDOS,
-)
-supervisor_file_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-supervisor_file_handler.setFormatter(formatter)
-logger.addHandler(supervisor_file_handler)
-
-#  Handler para consola (solo INFO y superior)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  # Solo INFO, WARNING, ERROR
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+    Se llama al arrancar el servicio (ver main), NO al importar el módulo: las
+    pruebas importan Prensas, y con los manejadores puestos al importar cada
+    corrida de pruebas escribía en el mismo logs/supervisor.log del servicio,
+    mezclando líneas de prueba con las reales.
+    """
+    if any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        return
+    archivo = RotatingFileHandler(
+        LOGS_DIR / "supervisor.log",
+        mode='a',
+        encoding='utf-8',
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_RESPALDOS,
+    )
+    for manejador in (archivo, logging.StreamHandler()):
+        manejador.setLevel(logging.INFO)
+        manejador.setFormatter(logging.Formatter(FORMATO_LOG))
+        logger.addHandler(manejador)
 
 station_loggers = {}
+# Lo piden a la vez el hilo de los PLC, el de catálogo y el de BD: sin
+# candado, dos hilos podían crear el mismo logger y escribir cada línea dos
+# veces, con dos manejadores rotando el mismo archivo.
+_station_loggers_lock = threading.Lock()
 
 # Intervalo (en segundos) para volver a leer la configuración de la BD
 POLL_INTERVAL = 60  # 🚀 Aumentado a 60s (se puede forzar update manual)
 
-# Archivo CSV de números de parte no encontrados
-CSV_FILE = CSV_DIR / "parts_not_found.csv"
 # Bitácora de rechazos en JSONL (reemplaza el CSV que se releía con pandas)
 RECHAZOS = RechazosStore(CSV_DIR / "parts_not_found.jsonl")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "9100"))
@@ -138,7 +136,7 @@ HTTP_PORT = int(os.getenv("HTTP_PORT", "9100"))
 PLC_CONNECTION_TIMEOUT = 15   # segundos para el connect() inicial
 
 #: Segundos que se le dan al PLC para responder una lectura. Se pasa a
-#: Type3E.setaccessopt(timer_sec=...), que es quien sabe traducirlo: el PLC
+#: ClienteMC.setaccessopt(timer_sec=...), que es quien sabe traducirlo: el PLC
 #: recibe timer_sec*4 en unidades de 250ms (su propio aviso de "ya me tardé"),
 #: y el socket espera timer_sec+1 —un segundo más, el margen que pide la
 #: propia librería para que esa respuesta de timeout le dé tiempo de llegar.
@@ -171,89 +169,103 @@ DB_WORKERS = int(os.getenv('DB_WORKERS', '8'))           # limita conexiones SQL
 _plc_executor = ThreadPoolExecutor(max_workers=PLC_IO_WORKERS, thread_name_prefix="plc-io")
 _db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="db")
 
+#: Traducción de lo que manda el PLC cuando hay que consultar el catálogo (el
+#: MDI de Estampado). Aparte de _db_executor para que no espere detrás del
+#: registro de producción, ni el registro detrás de ella.
+CATALOGO_WORKERS = int(os.getenv('CATALOGO_WORKERS', '4'))
+_catalogo_executor = ThreadPoolExecutor(max_workers=CATALOGO_WORKERS,
+                                        thread_name_prefix="catalogo")
+
 # ═══════════════════════════ POOL DE CONEXIONES ═══════════════════════════
 
+def _cerrar_sin_error(conn):
+    """Cerrar una conexión que puede estar ya muerta no debe tumbar a nadie."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 class ConnectionPool:
-    """Pool simple para reutilizar conexiones"""
+    """
+    Una conexión a SQL Server POR HILO, reutilizada mientras sirva.
 
-    _sql_pool = {}  # {connection_key: (conn, last_used)}
-    _as400_pool = {}  # {connection_key: (conn, last_used)}
-    _cleanup_interval = 300  # Limpiar conexiones inactivas cada 300 segundos
-    _max_idle_time = 600  # Max 10 minutos inactiva
-    _lock = threading.RLock()
+    Por hilo y no global: pyodbc no admite usar una conexión desde dos hilos a
+    la vez, y con una sola compartida los commit de una estación confirmaban
+    el trabajo a medias de otra. El total queda acotado por los executors.
+
+    La conexión NO se prueba antes de entregarla. Antes cada petición lanzaba
+    un SELECT 1 —una consulta extra por estación por segundo— para descubrir
+    una conexión muerta. Ahora quien recibe un error del driver la descarta
+    (ver descartar_conexion) y la siguiente petición abre otra: una conexión
+    caída cuesta un ciclo fallido, que no pierde nada porque sin commit la
+    línea base no se mueve.
+    """
+
+    _conexiones = {}            # {id de hilo: (conexión, último uso)}
+    _lock = threading.Lock()
+    _intervalo_limpieza = 300   # segundos entre revisiones de inactivas
+    _max_inactiva = 600         # segundos sin uso antes de cerrarla
+    _ultima_limpieza = system_time.monotonic()
 
     @classmethod
-    def get_sql_connection(cls):
-        """
-        Obtiene o crea conexión SQL reutilizable, UNA POR HILO.
-
-        Antes existía una sola conexión global ("default_sql") compartida por todo
-        el sistema: los commit de una estación confirmaban el trabajo a medias de
-        otra, y en cuanto el I/O dejó de bloquear el loop esa conexión pasaría a
-        usarse concurrentemente (pyodbc no lo soporta). Indexar por hilo garantiza
-        que dos unidades de trabajo nunca compartan conexión, y acota el total al
-        tamaño de los executors.
-        """
+    def obtener(cls):
+        """La conexión de este hilo, o una nueva. None si no se pudo conectar."""
+        hilo = threading.get_ident()
+        ahora = system_time.monotonic()
         with cls._lock:
-            current_time = datetime.now()
-            connection_key = f"sql_{threading.get_ident()}"
+            if ahora - cls._ultima_limpieza > cls._intervalo_limpieza:
+                cls._cerrar_inactivas(ahora)
+                cls._ultima_limpieza = ahora
+            entrada = cls._conexiones.get(hilo)
+            if entrada:
+                cls._conexiones[hilo] = (entrada[0], ahora)
+                return entrada[0]
 
-            # Limpiar conexiones antiguas periódicamente
-            if hasattr(cls, '_last_cleanup'):
-                if (current_time - cls._last_cleanup).total_seconds() > cls._cleanup_interval:
-                    cls._cleanup_old_connections()
-                    cls._last_cleanup = current_time
-            else:
-                cls._last_cleanup = current_time
-
-            # Reutilizar conexión existente si está disponible y válida
-            if connection_key in cls._sql_pool:
-                conn, last_used = cls._sql_pool[connection_key]
-
-                # Verificar si la conexión sigue viva
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT 1")
-                    cursor.fetchone()
-
-                    # Actualizar tiempo de uso
-                    cls._sql_pool[connection_key] = (conn, current_time)
-
-                    # Log solo la primera vez
-                    if not hasattr(cls, '_sql_reused_logged'):
-                        logger.debug("♻️ Reutilizando conexión SQL existente")
-                        cls._sql_reused_logged = True
-
-                    return conn
-                except:
-                    # Conexión muerta, cerrar y crear nueva
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                    del cls._sql_pool[connection_key]
-
-            # Crear nueva conexión
-            conn = cls._create_sql_connection()
-            if conn:
-                cls._sql_pool[connection_key] = (conn, current_time)
-                logger.debug("🔗 Nueva conexión SQL creada para pool")
-
-            return conn
+        # Conectar puede tardar todo el Connect Timeout: fuera del candado,
+        # para que una base lenta no detenga a los hilos que ya tienen la suya.
+        conn = cls._conectar()
+        if conn is not None:
+            with cls._lock:
+                cls._conexiones[hilo] = (conn, ahora)
+        return conn
 
     @classmethod
-    def _create_sql_connection(cls):
-        """Crea una nueva conexión SQL (sin loggear cada vez)"""
+    def descartar(cls):
+        """Cierra la conexión de este hilo; la próxima petición abre otra."""
+        with cls._lock:
+            entrada = cls._conexiones.pop(threading.get_ident(), None)
+        if entrada:
+            _cerrar_sin_error(entrada[0])
+
+    @classmethod
+    def cerrar_todas(cls):
+        """Para el apagado del servicio."""
+        with cls._lock:
+            conexiones = [conn for conn, _ in cls._conexiones.values()]
+            cls._conexiones.clear()
+        for conn in conexiones:
+            _cerrar_sin_error(conn)
+        logger.info("🔒 Todas las conexiones del pool cerradas")
+
+    @classmethod
+    def _cerrar_inactivas(cls, ahora):
+        """Se llama con el candado tomado."""
+        for hilo, (conn, uso) in list(cls._conexiones.items()):
+            if ahora - uso > cls._max_inactiva:
+                del cls._conexiones[hilo]
+                _cerrar_sin_error(conn)
+
+    @staticmethod
+    def _conectar():
         server = os.getenv('DB_SERVER')
         database = os.getenv('DB_NAME')
         username = os.getenv('DB_USER')
         password = os.getenv('DB_PASSWORD')
-
         if not all([server, database, username, password]):
             return None
-
         try:
-            connection_string = (
+            return pyodbc.connect(
                 f'DRIVER={{ODBC Driver 17 for SQL Server}};'
                 f'SERVER={server};'
                 f'DATABASE={database};'
@@ -261,128 +273,8 @@ class ConnectionPool:
                 f'PWD={password};'
                 f'Connect Timeout=10;'
             )
-
-            conn = pyodbc.connect(connection_string)
-            return conn
         except Exception:
             return None
-
-    @classmethod
-    def get_as400_connection(cls):
-        """Obtiene o crea conexión AS400 reutilizable, UNA POR HILO (ver get_sql_connection)"""
-        with cls._lock:
-            current_time = datetime.now()
-            connection_key = f"as400_{threading.get_ident()}"
-
-            # Reutilizar conexión existente si está disponible y válida
-            if connection_key in cls._as400_pool:
-                conn, last_used = cls._as400_pool[connection_key]
-
-                # Verificar si la conexión sigue viva (timeout de 5 segundos)
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT 1 FROM SYSIBM.SYSDUMMY1")
-                    cursor.fetchone()
-
-                    # Actualizar tiempo de uso
-                    cls._as400_pool[connection_key] = (conn, current_time)
-
-                    # Log solo la primera vez
-                    if not hasattr(cls, '_as400_reused_logged'):
-                        logger.debug("♻️ Reutilizando conexión AS400 existente")
-                        cls._as400_reused_logged = True
-
-                    return conn
-                except:
-                    # Conexión muerta, cerrar y crear nueva
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                    del cls._as400_pool[connection_key]
-
-            # Crear nueva conexión
-            conn = cls._create_as400_connection()
-            if conn:
-                cls._as400_pool[connection_key] = (conn, current_time)
-                logger.debug("🔗 Nueva conexión AS400 creada para pool")
-
-            return conn
-
-    @classmethod
-    def _create_as400_connection(cls):
-        """Crea una nueva conexión AS400"""
-        host = os.getenv('AS400_HOST')
-        user = os.getenv('AS400_USER')
-        password = os.getenv('AS400_PASSWORD')
-
-        if not all([host, user, password]):
-            return None
-
-        try:
-            conn_str = f"DRIVER={{iSeries Access ODBC Driver}};SYSTEM={host};UID={user};PWD={password};"
-            conn = pyodbc.connect(conn_str)
-            return conn
-        except Exception:
-            return None
-
-    @classmethod
-    def _cleanup_old_connections(cls):
-        """Limpia conexiones inactivas"""
-        with cls._lock:
-            current_time = datetime.now()
-
-            # Limpiar SQL
-            keys_to_remove = []
-            for key, (conn, last_used) in cls._sql_pool.items():
-                if (current_time - last_used).total_seconds() > cls._max_idle_time:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                    keys_to_remove.append(key)
-
-            for key in keys_to_remove:
-                del cls._sql_pool[key]
-
-            if keys_to_remove:
-                logger.debug(f"🧹 Limpiadas {len(keys_to_remove)} conexiones SQL inactivas")
-
-            # Limpiar AS400
-            keys_to_remove = []
-            for key, (conn, last_used) in cls._as400_pool.items():
-                if (current_time - last_used).total_seconds() > cls._max_idle_time:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                    keys_to_remove.append(key)
-
-            for key in keys_to_remove:
-                del cls._as400_pool[key]
-
-            if keys_to_remove:
-                logger.debug(f"🧹 Limpiadas {len(keys_to_remove)} conexiones AS400 inactivas")
-
-    @classmethod
-    def close_all(cls):
-        """Cierra todas las conexiones (para shutdown)"""
-        with cls._lock:
-            for conn, _ in cls._sql_pool.values():
-                try:
-                    conn.close()
-                except:
-                    pass
-
-            for conn, _ in cls._as400_pool.values():
-                try:
-                    conn.close()
-                except:
-                    pass
-
-            cls._sql_pool.clear()
-            cls._as400_pool.clear()
-            logger.info("🔒 Todas las conexiones del pool cerradas")
 
 # ═══════════════════════════ CONFIGURACIÓN DE TURNOS ═══════════════════════════
 
@@ -391,7 +283,7 @@ SHIFTS_CONFIG = {}
 
 def load_shifts_config() -> Dict[int, Dict]:
     """Carga configuración de turnos desde la base de datos"""
-    conn = ConnectionPool.get_sql_connection()
+    conn = create_connection()
     if conn is None:
         logger.warning("⚠️ No se pudo conectar para cargar turnos")
         return {}
@@ -430,8 +322,8 @@ def load_shifts_config() -> Dict[int, Dict]:
     except Exception as e:
         logger.error(f"❌ Error cargando turnos: {e}")
         logger.error(traceback.format_exc())
+        descartar_conexion()
         return {}
-    # NOTA: No cerramos la conexión aquí, el pool la maneja
 
 def _firma_turnos(cfg):
     """Firma comparable de la configuración de turnos."""
@@ -520,48 +412,49 @@ def registrar_error_validacion(estacion, numero_original, tipo_error,
 # ═══════════════════════════ HELPERS LOGGING ═══════════════════════════
 
 def get_station_logger(estacion):
-    """Obtiene o crea un logger específico para una estación con ROTACIÓN DE LOGS"""
-    if estacion in station_loggers:
-        return station_loggers[estacion]
+    """
+    Logger propio de la estación: solo a su archivo logs/<estación>.log, con
+    rotación, sin consola y sin propagar al supervisor.
+    """
+    existente = station_loggers.get(estacion)
+    if existente:
+        return existente
 
-    station_logger = logging.getLogger(f"station.{estacion}")
-    # CAMBIO: Solo WARNING y ERROR
-    station_logger.setLevel(logging.INFO)  # Solo WARNING, ERROR y CRITICAL
-    station_logger.propagate = False
+    with _station_loggers_lock:
+        if estacion in station_loggers:
+            return station_loggers[estacion]
 
-    log_path = LOGS_DIR / f"{estacion}.log"
+        station_logger = logging.getLogger(f"station.{estacion}")
+        station_logger.setLevel(logging.INFO)
+        station_logger.propagate = False
 
-    file_handler = RotatingFileHandler(
-        log_path,
-        mode='a',
-        encoding='utf-8',
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_RESPALDOS,
-    )
-    file_handler.setLevel(logging.INFO)  # Solo WARNING y ERROR
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    station_logger.addHandler(file_handler)
+        file_handler = RotatingFileHandler(
+            LOGS_DIR / f"{estacion}.log",
+            mode='a',
+            encoding='utf-8',
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_RESPALDOS,
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(FORMATO_LOG))
+        station_logger.addHandler(file_handler)
 
-    # ❌ REMOVER handler de consola para estaciones
-    # Las estaciones solo deben escribir en sus archivos de log
-
-    station_loggers[estacion] = station_logger
-    return station_logger
+        station_loggers[estacion] = station_logger
+        return station_logger
 
 # ═══════════════════════════ CONEXIONES BD ═══════════════════════════
 
 def create_connection():
-    """Crea o reutiliza conexión a SQL Server usando pool"""
-    return ConnectionPool.get_sql_connection()
+    """La conexión SQL de este hilo (ver ConnectionPool)."""
+    return ConnectionPool.obtener()
 
-def crear_conexion_as400(host: str = None, user: str = None,
-                        password: str = None, database: str = "") -> Optional[pyodbc.Connection]:
-    """Crea o reutiliza conexión a AS400 usando pool"""
-    return ConnectionPool.get_as400_connection()
 
-# El multiplicador ya no viene de AS400: sale de attributes.pieces_per_shot
-# en la misma consulta SQL. Ver persistence/catalogo.py
+def descartar_conexion():
+    """
+    Tras un error del driver: la próxima petición de este hilo abre una
+    conexión nueva en vez de seguir usando una que puede estar muerta.
+    """
+    ConnectionPool.descartar()
 
 # ═══════════════════════════ FUNCIONES BASE DE DATOS (COMUNES) ═══════════════════════════
 
@@ -644,96 +537,62 @@ def load_config():
     except Exception as e:
         logger.error(f"❌ Error cargando configuración: {e}")
         logger.error(traceback.format_exc())
+        descartar_conexion()
         return {}
-    # NOTA: No cerramos la conexión aquí, el pool la maneja
 
-# Quién consulta el multiplicador lo decide el ÁREA: solo Estampado lee
-# pieces_per_shot (antes venía de AS400); las demás cuentan una pieza por golpe.
-def lector_multiplicador(pipeline):
-    """Devuelve la función que el repositorio usará para el multiplicador."""
-    if getattr(pipeline, 'usa_multiplicador', False):
-        return catalogo.obtener_multiplicador
-    return repo._sin_multiplicador
+# ═══════════════════════════ CATÁLOGO DE MDI (ESTAMPADO) ═══════════════════════════
 
+#: Cuánto se reutiliza la traducción de un MDI antes de volver a consultarla.
+#: Sin caducidad, un MDI dado de alta o corregido en el catálogo seguía
+#: rechazado hasta reiniciar el servicio. Un fallo caduca antes que un
+#: acierto: es justo lo que alguien puede estar corrigiendo, y si fue la base
+#: la que no respondió, se reintenta pronto sin martillarla cada segundo.
+VIGENCIA_MDI_RESUELTO = 600   # segundos
+VIGENCIA_MDI_FALLIDO = 30     # segundos
 
-# ═══════════════════════════ UTILS (STRING & BLOCK) ═══════════════════════════
+#: {(estacion, mdi): ((numeros, error), vence_en)}. Lo usan los hilos de
+#: _catalogo_executor: leer y escribir una clave del dict es atómico, y una
+#: carrera entre dos hilos solo cuesta repetir una consulta.
+_mdi_resueltos = {}
 
-def expand_block(address: str, length: int) -> list[str]:
-    """
-    Dado un address tipo "W12A0" o "W120A" y un length n,
-    devuelve ["W12A0","W12A1",...,"W12A0+(n-1)"] o ["W120A","W121A",...,"W120+(n-1)A"]
-    """
-    import re
-
-    match1 = re.match(r'^([A-Z]+)(\d+)([A-F])(\d+)$', address)
-    if match1:
-        prefix = match1.group(1)
-        numbers1 = match1.group(2)
-        middle_letter = match1.group(3)
-        last_num = int(match1.group(4))
-        return [f"{prefix}{numbers1}{middle_letter}{last_num + i}" for i in range(length)]
-
-    match2 = re.match(r'^([A-Z]+)(\d+)([A-F])$', address)
-    if match2:
-        prefix = match2.group(1)
-        numbers = int(match2.group(2))
-        suffix_letter = match2.group(3)
-        return [f"{prefix}{numbers + i}{suffix_letter}" for i in range(length)]
-
-    match3 = re.match(r'^([A-Z]+)(\d+)$', address)
-    if match3:
-        prefix = match3.group(1)
-        numbers = int(match3.group(2))
-        return [f"{prefix}{numbers + i}" for i in range(length)]
-
-    prefix = ''.join(ch for ch in address if not ch.isdigit())
-    num_str = ''.join(ch for ch in address if ch.isdigit())
-    if num_str:
-        num = int(num_str)
-        return [f"{prefix}{num + i}" for i in range(length)]
-    else:
-        return [f"{address}{i}" for i in range(length)]
-
-# decodificar_bloque vive ahora en plc/decodificador.py
-
-# procesar_numero_parte vive ahora en domain/partes.py (importado arriba)
-
-# ═══════════════════════════ 🆕 NUEVA FUNCIÓN: VALIDACIÓN ESTAMPADO ═══════════════════════════
-
-# Cache global para almacenar números de parte validados por MDI y estación
-# Estructura: {(estacion, mdi): [lista_de_numeros_parte_validados]}
-validacion_estampado_cache = {}
 
 def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> tuple:
     """
     Traduce el MDI del troquel a los números de parte de esa estación.
 
-    Antes consultaba AS400 (LX834F01.IIU) y luego filtraba contra SQL Server.
-    Ahora sale todo de una sola consulta: el MDI vive en attributes.[key]='mid'.
-    Ver persistence/catalogo.py
-
     Devuelve (numeros_activos, error). El error va al tablero de rechazos y
-    distingue: MDI_NO_EXISTE, MDI_DE_OTRA_ESTACION, PART_NUMBER_OBSOLETO.
-    """
-    cache_key = (estacion, mdi)
-    if cache_key in validacion_estampado_cache:
-        return validacion_estampado_cache[cache_key]
+    distingue MDI_NO_EXISTE, MDI_DE_OTRA_ESTACION y PART_NUMBER_OBSOLETO del
+    catálogo, y SIN_CONEXION_BD / DB_ERROR cuando no respondió la base. Ver
+    persistence/catalogo.py
 
+    Consulta la base, así que corre en _catalogo_executor y nunca en el hilo
+    que lee los PLC (ver IPDataCollector.collect_and_enqueue).
+    """
+    clave = (estacion, mdi)
+    ahora = system_time.monotonic()
+    guardado = _mdi_resueltos.get(clave)
+    if guardado and guardado[1] > ahora:
+        return guardado[0]
+
+    resultado = _resolver_mdi(mdi, estacion, log)
+    vigencia = VIGENCIA_MDI_RESUELTO if resultado[0] else VIGENCIA_MDI_FALLIDO
+    _mdi_resueltos[clave] = (resultado, ahora + vigencia)
+    return resultado
+
+
+def _resolver_mdi(mdi, estacion, log):
     conn = create_connection()
     if conn is None:
         log.error(f"❌ Sin conexión a BD para resolver MDI={mdi}")
         return [], "SIN_CONEXION_BD"
-
     try:
         with conn.cursor() as cursor:
-            numeros, _mults, error = catalogo.resolver_mdi(cursor, mdi, estacion, log)
+            return catalogo.resolver_mdi(cursor, mdi, estacion, log)
     except Exception as e:
         log.error(f"❌ Error resolviendo MDI={mdi}: {e}")
+        if isinstance(e, pyodbc.Error):
+            descartar_conexion()
         return [], "DB_ERROR"
-
-    resultado = (numeros, error)
-    validacion_estampado_cache[cache_key] = resultado
-    return resultado
 
 # ═══════════════════════════ PATRONES STRATEGY & FACTORY ═══════════════════════════
 
@@ -765,6 +624,11 @@ def registrar_history(cursor, pipeline, part_number_id, cantidad, fecha_fmt, tie
                               shop_order_number=shop_order_number,
                               **pipeline.extras_history(dato or {}))
     except Exception as e:
+        # El interbloqueo ya revirtió la transacción entera: tragárselo aquí
+        # dejaba seguir el ciclo y avanzar la línea base sobre producción que
+        # ya no estaba en la base. Tiene que subir al bucle de reintentos.
+        if es_interbloqueo(e):
+            raise
         log.error(f"Error insert history: {e}")
 
 # ═══════════════════════════ RECOLECTOR DINÁMICO ═══════════════════════════
@@ -779,6 +643,10 @@ class IPDataCollector:
         # Última resolución con varias partes por lado, para no repetir el mismo
         # renglón en el log en cada ciclo (ver _process_station_data).
         self._ultima_division = {}
+        # Lados que el PLC respondió SIN número de parte en la última lectura,
+        # por estación. No son producción ni viajan al procesador: solo
+        # alimentan el tablero de lecturas en vivo (ver collect_and_enqueue).
+        self._sin_parte = {}
 
     def _parse_tag(self, tag_name):
         """Detecta tipo y lado del tag. La lógica vive en plc/decodificador.py"""
@@ -925,6 +793,7 @@ class IPDataCollector:
         log = get_station_logger(estacion)
 
         datos_estacion = []
+        self._sin_parte[estacion] = []
         for grp, data in groups_data.items():
             if 'contador' not in data:
                 continue
@@ -933,8 +802,8 @@ class IPDataCollector:
             troquel_id = data.get('troquel', None)
 
             # El área decide cómo se traduce lo que manda el PLC a números de
-            # parte. Estampado resuelve el MDI contra AS400; las demás expanden
-            # las alternativas con '/'. Ver areas/
+            # parte. Estampado resuelve el MDI contra el catálogo; las demás
+            # expanden las alternativas con '/'. Ver areas/
             raw = partes.get('orig') or ''
             ctx_area = ContextoArea(
                 estacion=estacion, log=log,
@@ -943,10 +812,6 @@ class IPDataCollector:
             nombres_parte, error_parte = self._pipeline.resolver_partes(raw, ctx_area)
 
             if nombres_parte:
-                # requiere_validacion_bd: en Estampado el número ya se validó
-                # contra AS400 y part_numbers, así que entra como validado.
-                validado_flag = None if self._pipeline.requiere_validacion_bd() else True
-
                 # Solo se registra cuando CAMBIA. Antes salía en cada ciclo:
                 # con un MDI de dos partes eso son 86,400 renglones idénticos al
                 # día por lado, ~10 MB que tapan lo que sí hay que ver.
@@ -968,7 +833,7 @@ class IPDataCollector:
                         'contador': data['contador'],
                         'tiempo': data.get('tiempo', 0.0),
                         'troquel_id': troquel_id,
-                        'validado': validado_flag,
+                        'validado': True,
                         'error_validacion': None,
                         'lado': grp  # 🆕 Identificar el lado/grupo
                     })
@@ -986,6 +851,17 @@ class IPDataCollector:
                     'validado': False,
                     'error_validacion': error_parte,
                     'lado': grp  # 🆕 Identificar el lado/grupo
+                })
+            else:
+                # El PLC respondió y el lado viene en blanco. Para el conteo no
+                # es nada —por eso no entra a datos_estacion—, pero el tablero
+                # de lecturas en vivo tiene que verlo o se queda mostrando el
+                # último número que ese lado tuvo.
+                self._sin_parte[estacion].append({
+                    'lado': grp,
+                    'contador': data['contador'],
+                    'tiempo': data.get('tiempo', 0.0),
+                    'troquel_id': troquel_id,
                 })
 
         return datos_estacion
@@ -1009,16 +885,12 @@ class IPDataCollector:
                         _plc_executor,
                         functools.partial(plc.batchread_wordunits, headdevice=head, readsize=length)
                     )
-                    if not vals or len(vals) < length:
-                        received = len(vals) if vals else 0
-                        logger.warning(f"⚠️ batchread_wordunits devolvió {received}/{length} words para '{head}' en PLC {self.ip}.")
-                        for sub in req['sub_blocks']:
-                            block_data[sub['orig']] = None
-                        continue
+                    # ClienteMC garantiza la respuesta completa y del tamaño
+                    # pedido, o lanza: aquí no hay lecturas a medias.
                     for sub in req['sub_blocks']:
-                        orig_addr, orig_len = sub['orig']
+                        _, largo = sub['orig']
                         offset = sub['offset']
-                        block_data[sub['orig']] = vals[offset:offset + orig_len]
+                        block_data[sub['orig']] = vals[offset:offset + largo]
                 except OSError as batch_error:
                     winerr = getattr(batch_error, 'winerror', None) or batch_error.errno
                     if winerr == 10054:
@@ -1051,7 +923,15 @@ class IPDataCollector:
                 # plc_ok=False marca lectura incompleta: el consumidor conserva el
                 # caché en vez de cerrar registros por ausencia de datos.
                 lectura_ok = not self._lectura_degradada(cfg, block_data)
-                datos_estacion = self._process_station_data(est, cfg, block_data, now)
+                if self._pipeline.resuelve_en_catalogo:
+                    # Traducir consulta la base: fuera de este hilo, que es el
+                    # que lee TODOS los PLC. Con la base lenta o caída, esa
+                    # espera congelaba la lectura de la planta entera.
+                    datos_estacion = await loop.run_in_executor(
+                        _catalogo_executor, self._process_station_data,
+                        est, cfg, block_data, now)
+                else:
+                    datos_estacion = self._process_station_data(est, cfg, block_data, now)
                 if datos_estacion:
                     batch.append({'estacion': est, 'datos': datos_estacion, 'ts': now,
                                   'area': self.area, 'plc_ok': lectura_ok})
@@ -1072,11 +952,21 @@ class IPDataCollector:
             # abrir una segunda conexión. Se registra lo que el PLC mandó, antes
             # de cualquier decisión de negocio: aunque la parte se rechace o el
             # contador no avance, aquí se ve.
+            #
+            # Un lado que respondió SIN número se anota igual, en blanco: si
+            # no, la fila se quedaba con el último número y contador que tuvo
+            # y parecía que el PLC lo seguía mandando. Con lectura completa,
+            # los lados que ya no vienen se quitan; con lectura parcial no se
+            # toca nada y la antigüedad de la fila es la que avisa.
             for pkg in batch:
-                for d in pkg.get('datos', []):
-                    try:
+                try:
+                    est = pkg['estacion']
+                    vistos = set()
+                    for d in pkg.get('datos', []):
+                        lado = d.get('lado', '--')
+                        vistos.add(lado)
                         LECTURAS.anotar(
-                            pkg['estacion'], d.get('lado', '--'),
+                            est, lado,
                             ip=self.ip, area=self.area,
                             numero_plc=d.get('original'),
                             numero_validado=d.get('parte'),
@@ -1086,8 +976,22 @@ class IPDataCollector:
                             validado=d.get('validado'),
                             error=d.get('error_validacion'),
                         )
-                    except Exception:
-                        pass
+                    for v in self._sin_parte.get(est, []):
+                        if v['lado'] in vistos:
+                            continue
+                        vistos.add(v['lado'])
+                        LECTURAS.anotar(
+                            est, v['lado'],
+                            ip=self.ip, area=self.area,
+                            contador=v.get('contador'),
+                            tiempo_ciclo=v.get('tiempo'),
+                            troquel=v.get('troquel_id'),
+                            sin_parte=True,
+                        )
+                    if pkg.get('plc_ok'):
+                        LECTURAS.conservar_lados(est, vistos)
+                except Exception:
+                    pass
 
             if batch and self.ip in ip_data_queues:
                 try:
@@ -1110,6 +1014,12 @@ class IPDataProcessor:
         # pasan por él; ver persistence/estado.py para por qué hace falta.
         self.contadores_lado = {}
         self.last_scanned_parts = {}  # 🆕 Polling optimization cache
+        # Estaciones paradas (lectura completa, sin partes) a las que ya se les
+        # cerró lo que tenían abierto. Mientras sigan así no se vuelve a tocar
+        # la base: antes era un UPDATE + commit por estación por segundo, para
+        # siempre. Vive solo en memoria: al reiniciar el servicio se cierra una
+        # vez más, que es lo correcto si algo quedó abierto entretanto.
+        self._estaciones_cerradas = set()
         self.state_file = STATE_DIR / f"state_{self.ip.replace('.', '_')}.json"
         self.load_state()
 
@@ -1213,7 +1123,7 @@ class IPDataProcessor:
             'visto_en': system_time.time(),
         }
 
-    def _linea_base_de_corrida(self, cursor, estacion, num, cnt, pipeline, log,
+    def _linea_base_de_corrida(self, cursor, estacion, num, cnt, log,
                                corridas_previas, contador_lado=None):
         """
         Desde qué valor del contador se empieza a contar una parte recién vista.
@@ -1237,56 +1147,49 @@ class IPDataProcessor:
         número: el registro todavía traía el sobrante de la parte que salía y se
         daba por corrida nueva de la que entraba.
 
+        Si la consulta a la base falla, el error sube y el ciclo se reintenta:
+        suponer cualquiera de las dos respuestas cuesta producción, sea
+        perdiéndola o inventándola.
+
         `corridas_previas` memoriza la respuesta POR CICLO y es imprescindible:
         cuando LH y RH producen la misma parte, el primer lado en registrarse
         deja la orden En progreso, y sin la memoria el segundo lado creería que
         su contador ya estaba contado y tiraría su arranque a la basura.
-
-        Devuelve (linea_base, multiplicador).
         """
-        leer_mult = lector_multiplicador(pipeline)
-        try:
-            mult = leer_mult(cursor, num, estacion, log) or 1
-        except Exception as e:
-            log.error(f"❌ No se pudo leer el multiplicador de {num} en {estacion}: {e}")
-            mult = 1
-
         if contador_lado is not None:
             if contador_lado:
                 log.info(
                     f"🔗 {estacion}/{num}: el registro del lado NO se reinició, "
-                    f"viene en {contador_lado}; se cuenta desde ahí (mult={mult})."
+                    f"viene en {contador_lado}; se cuenta desde ahí."
                 )
             else:
-                log.info(
-                    f"🔗 {estacion}/{num}: el registro del lado venía en 0, "
-                    f"corrida limpia (mult={mult})."
-                )
-            return contador_lado, mult
+                log.info(f"🔗 {estacion}/{num}: el registro del lado venía en 0, corrida limpia.")
+            return contador_lado
 
-        if num in corridas_previas:
-            en_progreso = corridas_previas[num]
-        else:
-            try:
-                en_progreso = ordenes.hay_corrida_en_progreso(cursor, estacion, num)
-            except Exception as e:
-                # Ante la duda no se inventa producción: se cuenta desde aquí.
-                log.error(f"❌ No se pudo comprobar la corrida de {num} en {estacion}: {e}")
-                en_progreso = True
-            corridas_previas[num] = en_progreso
+        if num not in corridas_previas:
+            corridas_previas[num] = ordenes.hay_corrida_en_progreso(cursor, estacion, num)
 
-        if en_progreso:
+        if corridas_previas[num]:
             log.info(
                 f"↩️ {estacion}/{num}: ya había una orden en progreso, "
-                f"se cuenta desde cnt={cnt} (mult={mult})."
+                f"se cuenta desde cnt={cnt}."
             )
-            return cnt, mult
+            return cnt
 
-        log.info(
-            f"▶️ {estacion}/{num}: corrida nueva, el contador trae {cnt} "
-            f"por registrar (mult={mult})."
-        )
-        return 0, mult
+        log.info(f"▶️ {estacion}/{num}: corrida nueva, el contador trae {cnt} por registrar.")
+        return 0
+
+    def _rechazar_en_bd(self, estacion, lado, num_orig, num, cnt, area, error, log):
+        """
+        La parte no tuvo dónde registrarse. La línea base NO se mueve: cuando
+        el contador vuelva a avanzar, el siguiente ciclo reintenta con el
+        delta completo en vez de perderlo.
+        """
+        log.warning(f"⚠️ Número de parte RECHAZADO EN BD: {num_orig} - {error}")
+        registrar_error_validacion(estacion, num_orig, error, lado=lado, area=area)
+        anotar_estado(estacion, lado, motivo_de_error(error),
+                      area=area, ip=self.ip, numero_plc=num_orig,
+                      numero_validado=num, contador=cnt, detalle=error)
 
     async def process_continuously(self):
         if self.ip not in ip_data_queues: return
@@ -1356,6 +1259,27 @@ class IPDataProcessor:
 
         log = get_station_logger(estacion)
 
+        # Las dos ramas sin partes se resuelven ANTES de pedir conexión: ni la
+        # lectura incompleta ni una estación parada que ya se cerró tienen
+        # nada que hacer en la base.
+        if not datos:
+            if not plc_ok:
+                REGISTRO.anotar_estacion(estacion, obs_estado.LECTURA_PARCIAL)
+                # Lectura incompleta: NO se puede concluir que la estación dejó
+                # de producir. Se conserva la línea base de contadores para que
+                # al reconectar el delta recupere lo producido en el hueco.
+                log.warning(
+                    f"⚠️ Lectura incompleta del PLC para {estacion}. "
+                    f"Manteniendo estado en caché sin cambios."
+                )
+                return False
+
+            REGISTRO.anotar_estacion(estacion, obs_estado.ESTACION_SIN_PARTES)
+            if estacion in self._estaciones_cerradas:
+                return False
+        else:
+            self._estaciones_cerradas.discard(estacion)
+
         conn = create_connection()
         if conn is None:
             log.error("❌ No se pudo obtener conexión a BD para procesar estación")
@@ -1386,24 +1310,18 @@ class IPDataProcessor:
                     diferidos = []
 
                     if not datos:
-                        if not plc_ok:
-                            REGISTRO.anotar_estacion(estacion, obs_estado.LECTURA_PARCIAL)
-                            # Lectura incompleta: NO se puede concluir que la estación dejó
-                            # de producir. Se conserva la línea base de contadores para que
-                            # al reconectar el delta recupere lo producido en el hueco.
-                            log.warning(
-                                f"⚠️ Lectura incompleta del PLC para {estacion}. "
-                                f"Manteniendo estado en caché sin cambios."
-                            )
-                            return False
-
-                        # Lectura buena y sin partes: la estación sí dejó de producir.
-                        REGISTRO.anotar_estacion(estacion, obs_estado.ESTACION_SIN_PARTES)
+                        # Lectura buena y sin partes: la estación dejó de
+                        # producir. Se cierra lo que quedó abierto UNA sola vez
+                        # (ver _estaciones_cerradas); si el commit falla, no se
+                        # marca y el siguiente ciclo lo vuelve a intentar.
                         ordenes.detener_estacion(cursor, estacion, fecha_fmt)
 
-                        # Se cierra lo que quedó abierto. La línea base se
-                        # conserva o no según el mismo criterio que el bucle de
-                        # obsoletas más abajo: ver _lado_protegido.
+                        # La línea base se conserva o no según el mismo
+                        # criterio que el bucle de obsoletas más abajo: ver
+                        # _lado_protegido. Lo que se conserve (un lado sin
+                        # observación, dentro de su ventana) se resuelve cuando
+                        # la estación vuelva a mandar partes, o en la purga
+                        # del arranque.
                         ahora_epoch = system_time.time()
                         for k in [k for k in self.active_records
                                   if k.startswith(f"{estacion}_")]:
@@ -1426,6 +1344,7 @@ class IPDataProcessor:
                                 diferidos.append(olvidar_de_estacion)
                                 state_changed = True
 
+                        diferidos.append(lambda: self._estaciones_cerradas.add(estacion))
                         conn.commit()
 
                         # Esta rama tiene su propio commit, así que también le
@@ -1563,12 +1482,11 @@ class IPDataProcessor:
                         prev_lado = self._contador_del_lado(estacion, lado_actual)
 
                         if reg is None:
-                            base, mult = self._linea_base_de_corrida(
-                                cursor, estacion, num, cnt, pipeline, log, corridas_previas,
+                            base = self._linea_base_de_corrida(
+                                cursor, estacion, num, cnt, log, corridas_previas,
                                 contador_lado=prev_lado)
                             reg = {
                                 'contador_registro': base,
-                                'multiplicador': mult,
                                 'numero_original': num_orig,
                                 'lado': lado_actual,
                                 'id_en_curso': None,
@@ -1683,21 +1601,6 @@ class IPDataProcessor:
                             state_changed = True
                             continue
 
-                        multiplicador = reg.get('multiplicador', 1) or 1
-                        if pipeline.usa_multiplicador:
-                            # Solo Estampado. pieces_per_shot puede corregirse en
-                            # caliente y releerlo cuesta una consulta pequeña; el
-                            # precio de no hacerlo es registrar toda una corrida con
-                            # un multiplicador viejo, que después nadie cuadra.
-                            leido = lector_multiplicador(pipeline)(cursor, num, estacion, log) or 1
-                            if leido != multiplicador:
-                                log.info(
-                                    f"🔧 {estacion}/{num}: piezas por golpe {multiplicador} → {leido}"
-                                )
-                                reg['multiplicador'] = leido
-                                state_changed = True
-                            multiplicador = leido
-
                         # El id de la parte no cambia mientras dure la corrida, así que
                         # se resuelve una vez y se guarda con la línea base. Consultarlo
                         # en cada incremento costaba lo mismo que buscar las órdenes,
@@ -1707,6 +1610,28 @@ class IPDataProcessor:
                             part_number_id = obtener_part_number_id(cursor, num, estacion)
                             if part_number_id:
                                 reg['part_number_id'] = part_number_id
+                                state_changed = True
+
+                        multiplicador = 1
+                        if pipeline.usa_multiplicador:
+                            # Solo Estampado. Sale de la MISMA fila de part_numbers a
+                            # la que se registra (ver catalogo.obtener_multiplicador),
+                            # y se relee en cada incremento: pieces_per_shot puede
+                            # corregirse en caliente, y no hacerlo registraría toda
+                            # una corrida con un valor viejo que después nadie cuadra.
+                            if not part_number_id:
+                                # Sin fila vigente no hay de dónde leerlo, y
+                                # suponer 1 pieza por golpe registraría de menos.
+                                self._rechazar_en_bd(estacion, lado_actual, num_orig, num, cnt,
+                                                     area, "PART_NUMBER_NO_EXISTE_BD", log)
+                                continue
+                            multiplicador = catalogo.obtener_multiplicador(cursor, part_number_id)
+                            anterior = reg.get('multiplicador')
+                            if anterior != multiplicador:
+                                if anterior is not None:
+                                    log.info(f"🔧 {estacion}/{num}: piezas por golpe "
+                                             f"{anterior} → {multiplicador}")
+                                reg['multiplicador'] = multiplicador
                                 state_changed = True
 
                         def anotar_historial(id_registro, orden_num, cantidad,
@@ -1742,14 +1667,8 @@ class IPDataProcessor:
                         )
 
                         if resultado.error:
-                            # No hubo dónde registrar. La línea base NO se mueve: el próximo
-                            # ciclo reintenta con el delta completo en vez de perderlo.
-                            log.warning(f"⚠️ Número de parte RECHAZADO EN BD: {num_orig} - {resultado.error}")
-                            registrar_error_validacion(estacion, num_orig, resultado.error,
-                                                       lado=lado_actual, area=area)
-                            anotar_estado(estacion, lado_actual, motivo_de_error(resultado.error),
-                                          area=area, ip=self.ip, numero_plc=num_orig,
-                                          numero_validado=num, contador=cnt, detalle=resultado.error)
+                            self._rechazar_en_bd(estacion, lado_actual, num_orig, num, cnt,
+                                                 area, resultado.error, log)
                             continue
 
                         def avanzar(r=reg, c=cnt, curso=resultado.en_curso,
@@ -1815,9 +1734,13 @@ class IPDataProcessor:
                         f"intentos. La línea base NO se mueve: el próximo ciclo "
                         f"reintenta con el delta completo."
                     )
+                elif isinstance(e, ordenes.RegistroIncompleto):
+                    log.error(f"❌ {e}")
                 else:
                     log.error(f"❌ Error procesando {estacion}: {e}")
                     log.error(traceback.format_exc())
+                    if isinstance(e, pyodbc.Error):
+                        descartar_conexion()
                 return False
 
         # NOTA: No cerramos la conexión aquí, el pool la maneja
@@ -1832,9 +1755,9 @@ ip_processors = {}
 #  NUEVO: Función para conectar al PLC con timeout
 async def connect_plc_with_timeout(plc, ip, port, timeout=PLC_CONNECTION_TIMEOUT):
     """Conecta al PLC con timeout controlado"""
-    # FIX WinError 10061: cerrar socket previo ANTES de reconectar.
-    # Un socket en estado TIME_WAIT/CLOSE_WAIT hace que el OS rechace
-    # la nueva conexión con "Connection Refused" (10061).
+    # Se suelta la conexión anterior ANTES de abrir otra. ClienteMC cierra con
+    # RST: el PLC la libera en el momento en vez de dejarla ocupando un lugar
+    # de su tabla de conexiones (ver plc/cliente.py).
     try:
         plc.close()
     except Exception:
@@ -1884,7 +1807,7 @@ async def plc_reader(ip, port, group_info):
     #  NUEVO: Configuración inicial del PLC
     def create_plc_instance():
         """Crea una nueva instancia del PLC"""
-        plc = Type3E()
+        plc = ClienteMC()
         plc.network = 0
         plc.pc = 0xFF
         # setaccessopt toma segundos y deriva timer (250ms) y soc_timeout
@@ -1908,174 +1831,185 @@ async def plc_reader(ip, port, group_info):
     #  NUEVO: Direcciones para lectura
     addrs = list(group_info['all_addresses']) if 'all_addresses' in group_info else []
 
-    while True:
-        try:
-            # ¿Cambió la configuración de esta IP desde el último ciclo?
-            if group_info.get('_version', 0) != version_config:
-                version_config = group_info.get('_version', 0)
-                collector = IPDataCollector(
-                    ip, group_info['estaciones'], group_info.get('area', 'Default')
-                )
-                addrs = list(group_info.get('all_addresses', []))
-
-                nuevo_puerto = group_info.get('port', port)
-                if nuevo_puerto != port:
-                    # El puerto sí obliga a reconectar; los tags no.
-                    logger.info(f"🔌 {ip}: el puerto cambió {port} → {nuevo_puerto}, reconectando")
-                    port = nuevo_puerto
-                    try: plc.close()
-                    except Exception: pass
-                    connected = False
-                    plc = create_plc_instance()
-                else:
-                    logger.info(
-                        f"♻️ {ip}: configuración recargada (v{version_config}) "
-                        f"sin cerrar la conexión — {len(addrs)} bloque(s), "
-                        f"{len(group_info['estaciones'])} estación(es)"
+    try:
+        while True:
+            try:
+                # ¿Cambió la configuración de esta IP desde el último ciclo?
+                if group_info.get('_version', 0) != version_config:
+                    version_config = group_info.get('_version', 0)
+                    collector = IPDataCollector(
+                        ip, group_info['estaciones'], group_info.get('area', 'Default')
                     )
+                    addrs = list(group_info.get('all_addresses', []))
+                    # Una estación que ya no cuelga de esta IP no debe quedarse en
+                    # el tablero de lecturas en vivo con su último dato.
+                    LECTURAS.olvidar_ip(ip, excepto=group_info['estaciones'])
 
-            if not connected:
-                logger.info(f"🔌 Intentando conectar a PLC {ip}:{port}")
-
-                # Intentar conexión con timeout
-                connected = await connect_plc_with_timeout(plc, ip, port)
-
-                if connected:
-                    consecutive_failures = 0
-                    logger.info(f"✅ Conectado a PLC {ip}:{port}")
-                    try:
-                        obs_metricas.plc_conectado.labels(ip).set(1)
-                        obs_metricas.config_version.labels(ip).set(version_config)
-                    except Exception:
-                        pass
-
-                    # Actualizar monitor
-
-                    # Notificar a las estaciones
-                    for est in group_info['estaciones']:
-                        get_station_logger(est).info(f"✅ PLC {ip} conectado")
-                else:
-                    consecutive_failures += 1
-                    try:
-                        obs_metricas.plc_conectado.labels(ip).set(0)
-                    except Exception:
-                        pass
-                    for _est in group_info.get('estaciones', []):
-                        REGISTRO.anotar_estacion(_est, obs_estado.PLC_DESCONECTADO)
-                    if consecutive_failures >= max_consecutive_failures:
-                        # Escalonado: se duplica por cada fallo de más allá del
-                        # umbral, con tope. Machacar cada RECONNECT_DELAY fijo
-                        # mientras el PLC está realmente caído no lo revive más
-                        # rápido y solo llena el log sin decir nada nuevo.
-                        de_mas = consecutive_failures - max_consecutive_failures
-                        espera = min(RECONNECT_DELAY * (2 ** de_mas), RECONNECT_DELAY_MAX)
-                        logger.error(
-                            f"❌ {consecutive_failures} fallos consecutivos de conexión "
-                            f"con PLC {ip}, esperando {espera}s"
-                        )
-                        await asyncio.sleep(espera)
+                    nuevo_puerto = group_info.get('port', port)
+                    if nuevo_puerto != port:
+                        # El puerto sí obliga a reconectar; los tags no.
+                        logger.info(f"🔌 {ip}: el puerto cambió {port} → {nuevo_puerto}, reconectando")
+                        port = nuevo_puerto
+                        try: plc.close()
+                        except Exception: pass
+                        connected = False
+                        plc = create_plc_instance()
                     else:
-                        await asyncio.sleep(2)  # Espera corta entre intentos
-                    continue
+                        logger.info(
+                            f"♻️ {ip}: configuración recargada (v{version_config}) "
+                            f"sin cerrar la conexión — {len(addrs)} bloque(s), "
+                            f"{len(group_info['estaciones'])} estación(es)"
+                        )
 
-            #  LECTURA DEL PLC
-            current_time = datetime.now()
-            time_since_last_read = (current_time - last_read_time).total_seconds()
+                if not connected:
+                    logger.info(f"🔌 Intentando conectar a PLC {ip}:{port}")
 
-            if time_since_last_read >= read_interval:
-                try:
-                    # Leer datos
-                    await collector.collect_and_enqueue(plc, group_info)
-                    last_read_time = current_time
-                    intentos_lectura = 0
-                    try:
-                        obs_metricas.plc_lecturas.labels(ip, "ok").inc()
-                        obs_metricas.plc_ultima_lectura.labels(ip).set(current_time.timestamp())
-                    except Exception:
-                        pass
+                    # Intentar conexión con timeout
+                    connected = await connect_plc_with_timeout(plc, ip, port)
 
-                except OSError as read_error:
-                    winerr = getattr(read_error, 'winerror', None) or read_error.errno
-                    err_str = str(read_error)
+                    if connected:
+                        consecutive_failures = 0
+                        logger.info(f"✅ Conectado a PLC {ip}:{port}")
+                        try:
+                            obs_metricas.plc_conectado.labels(ip).set(1)
+                            obs_metricas.config_version.labels(ip).set(version_config)
+                        except Exception:
+                            pass
 
-                    # Timeout reconectar pero con delay corto
-                    try:
-                        obs_metricas.plc_lecturas.labels(
-                            ip, "timeout" if "timed out" in err_str else "error").inc()
-                        obs_metricas.plc_conectado.labels(ip).set(0)
-                    except Exception:
-                        pass
+                        # Actualizar monitor
 
-                    if "timed out" in err_str and winerr is None:
-                        intentos_lectura += 1
-                        if intentos_lectura <= MAX_REINTENTOS_LECTURA:
-                            # Un timeout aislado no dice que la conexión esté
-                            # mal: se reintenta sobre el MISMO socket antes de
-                            # pagar el costo de una reconexión completa.
-                            logger.warning(
-                                f"⏱️ Timeout leyendo PLC {ip} (intento "
-                                f"{intentos_lectura}/{MAX_REINTENTOS_LECTURA}), "
-                                f"reintento sin cerrar el socket..."
+                        # Notificar a las estaciones
+                        for est in group_info['estaciones']:
+                            get_station_logger(est).info(f"✅ PLC {ip} conectado")
+                    else:
+                        consecutive_failures += 1
+                        try:
+                            obs_metricas.plc_conectado.labels(ip).set(0)
+                        except Exception:
+                            pass
+                        for _est in group_info.get('estaciones', []):
+                            REGISTRO.anotar_estacion(_est, obs_estado.PLC_DESCONECTADO)
+                        if consecutive_failures >= max_consecutive_failures:
+                            # Escalonado: se duplica por cada fallo de más allá del
+                            # umbral, con tope. Machacar cada RECONNECT_DELAY fijo
+                            # mientras el PLC está realmente caído no lo revive más
+                            # rápido y solo llena el log sin decir nada nuevo.
+                            de_mas = consecutive_failures - max_consecutive_failures
+                            espera = min(RECONNECT_DELAY * (2 ** de_mas), RECONNECT_DELAY_MAX)
+                            logger.error(
+                                f"❌ {consecutive_failures} fallos consecutivos de conexión "
+                                f"con PLC {ip}, esperando {espera}s"
                             )
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(espera)
                         else:
-                            logger.warning(
-                                f"⏱️ Timeout leyendo PLC {ip} tras {intentos_lectura} "
-                                f"intentos — cerrando socket y reconectando..."
-                            )
+                            await asyncio.sleep(2)  # Espera corta entre intentos
+                        continue
+
+                #  LECTURA DEL PLC
+                current_time = datetime.now()
+                time_since_last_read = (current_time - last_read_time).total_seconds()
+
+                if time_since_last_read >= read_interval:
+                    try:
+                        with obs_metricas.plc_duracion_lectura.labels(ip).time():
+                            await collector.collect_and_enqueue(plc, group_info)
+                        last_read_time = current_time
+                        intentos_lectura = 0
+                        try:
+                            obs_metricas.plc_lecturas.labels(ip, "ok").inc()
+                            obs_metricas.plc_ultima_lectura.labels(ip).set(current_time.timestamp())
+                        except Exception:
+                            pass
+
+                    except OSError as read_error:
+                        winerr = getattr(read_error, 'winerror', None) or read_error.errno
+                        err_str = str(read_error)
+
+                        # Timeout reconectar pero con delay corto
+                        try:
+                            obs_metricas.plc_lecturas.labels(
+                                ip, "timeout" if "timed out" in err_str else "error").inc()
+                            obs_metricas.plc_conectado.labels(ip).set(0)
+                        except Exception:
+                            pass
+
+                        if "timed out" in err_str and winerr is None:
+                            intentos_lectura += 1
+                            if intentos_lectura <= MAX_REINTENTOS_LECTURA:
+                                # Un timeout aislado no dice que la conexión esté
+                                # mal: se reintenta sobre el MISMO socket antes de
+                                # pagar el costo de una reconexión completa.
+                                logger.warning(
+                                    f"⏱️ Timeout leyendo PLC {ip} (intento "
+                                    f"{intentos_lectura}/{MAX_REINTENTOS_LECTURA}), "
+                                    f"reintento sin cerrar el socket..."
+                                )
+                                await asyncio.sleep(1)
+                            else:
+                                logger.warning(
+                                    f"⏱️ Timeout leyendo PLC {ip} tras {intentos_lectura} "
+                                    f"intentos — cerrando socket y reconectando..."
+                                )
+                                try: plc.close()
+                                except Exception: pass
+                                connected = False
+                                plc = create_plc_instance()
+                                intentos_lectura = 0
+                                await asyncio.sleep(2)
+
+                        # WinError reales: requieren cierre de socket y reconexión completa
+                        elif winerr == 10054:
+                            logger.warning(f"🔌 WinError 10054 – PLC {ip} cerró la conexión durante lectura (Connection Reset by Peer). Reconectando...")
                             try: plc.close()
                             except Exception: pass
                             connected = False
                             plc = create_plc_instance()
                             intentos_lectura = 0
-                            await asyncio.sleep(2)
-
-                    # WinError reales: requieren cierre de socket y reconexión completa
-                    elif winerr == 10054:
-                        logger.warning(f"🔌 WinError 10054 – PLC {ip} cerró la conexión durante lectura (Connection Reset by Peer). Reconectando...")
-                        try: plc.close()
-                        except Exception: pass
+                            await asyncio.sleep(RECONNECT_DELAY)
+                        elif winerr == 10061:
+                            logger.warning(f"🔌 WinError 10061 – PLC {ip} rechazó la lectura (Connection Refused). Reconectando...")
+                            try: plc.close()
+                            except Exception: pass
+                            connected = False
+                            plc = create_plc_instance()
+                            intentos_lectura = 0
+                            await asyncio.sleep(RECONNECT_DELAY)
+                        else:
+                            logger.error(f"⚠️ OSError [{winerr}] en lectura PLC {ip}: {err_str[:120]}")
+                            try: plc.close()
+                            except Exception: pass
+                            connected = False
+                            plc = create_plc_instance()
+                            intentos_lectura = 0
+                            await asyncio.sleep(RECONNECT_DELAY)
+                    except Exception as read_error:
+                        logger.error(f"❌ Error en lectura PLC {ip}: {str(read_error)[:100]}")
+                        try:
+                            plc.close()
+                        except Exception:
+                            pass
                         connected = False
-                        plc = create_plc_instance()
                         intentos_lectura = 0
-                        await asyncio.sleep(RECONNECT_DELAY)
-                    elif winerr == 10061:
-                        logger.warning(f"🔌 WinError 10061 – PLC {ip} rechazó la lectura (Connection Refused). Reconectando...")
-                        try: plc.close()
-                        except Exception: pass
-                        connected = False
-                        plc = create_plc_instance()
-                        intentos_lectura = 0
-                        await asyncio.sleep(RECONNECT_DELAY)
-                    else:
-                        logger.error(f"⚠️ OSError [{winerr}] en lectura PLC {ip}: {err_str[:120]}")
-                        try: plc.close()
-                        except Exception: pass
-                        connected = False
-                        plc = create_plc_instance()
-                        intentos_lectura = 0
-                        await asyncio.sleep(RECONNECT_DELAY)
-                except Exception as read_error:
-                    logger.error(f"❌ Error en lectura PLC {ip}: {str(read_error)[:100]}")
-                    try:
-                        plc.close()
-                    except Exception:
-                        pass
-                    connected = False
-                    intentos_lectura = 0
-                    plc = create_plc_instance()  # Recrear instancia
-                    await asyncio.sleep(1)
+                        plc = create_plc_instance()  # Recrear instancia
+                        await asyncio.sleep(1)
 
-            #  ESPERA INTELIGENTE
-            time_to_wait = max(0, read_interval - (datetime.now() - current_time).total_seconds())
-            if time_to_wait > 0:
-                await asyncio.sleep(time_to_wait)
+                #  ESPERA INTELIGENTE
+                time_to_wait = max(0, read_interval - (datetime.now() - current_time).total_seconds())
+                if time_to_wait > 0:
+                    await asyncio.sleep(time_to_wait)
 
-        except Exception as e:
-            logger.error(f"❌ Error crítico en plc_reader para {ip}: {str(e)[:200]}")
-            connected = False
-            plc = create_plc_instance()
-            await asyncio.sleep(RECONNECT_DELAY)
+            except Exception as e:
+                logger.error(f"❌ Error crítico en plc_reader para {ip}: {str(e)[:200]}")
+                connected = False
+                plc = create_plc_instance()
+                await asyncio.sleep(RECONNECT_DELAY)
+    finally:
+        # Al cancelar el lector (apagado del servicio, o la IP salió de la
+        # configuración) se suelta la conexión con RST. Antes el socket se
+        # abandonaba y el sistema lo cerraba después con FIN: un módulo que
+        # no completa ese cierre (MK05) se quedaba con la conexión ocupada.
+        plc.close()
+
 
 def _huella_config(group_info):
     """
@@ -2210,6 +2144,7 @@ async def supervisor():
                     logger.info(f"🛑 Deteniendo PLC reader para {ip}")
                     tasks[ip].cancel()
                     del tasks[ip]
+                    LECTURAS.olvidar_ip(ip)
 
                     # Detener procesador también
                     proc_key = f"{ip}_processor"
@@ -2250,6 +2185,8 @@ def main():
     conteo sin que nadie se enterara. Ahora el servicio es el proceso principal
     y el monitoreo se consulta por HTTP (Grafana o curl).
     """
+    configurar_logging()
+
     faltantes = [v for v in ('DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD')
                  if not os.getenv(v)]
     if faltantes:
@@ -2261,6 +2198,7 @@ def main():
     logger.info(f"🏭 IoTDataPipeline · Python {sys.version.split()[0]}")
     logger.info(f"   Monitoreo: http://localhost:{HTTP_PORT}/estaciones/estado")
     logger.info("=" * 62)
+    logger.info(f"📋 Bitácora de rechazos: {RECHAZOS.combinaciones} combinación(es) previas")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -2291,8 +2229,9 @@ def main():
 
         # Los executors antes que el pool: sus hilos pueden estar usando conexiones
         _plc_executor.shutdown(wait=True, cancel_futures=True)
+        _catalogo_executor.shutdown(wait=True, cancel_futures=True)
         _db_executor.shutdown(wait=True, cancel_futures=True)
-        ConnectionPool.close_all()
+        ConnectionPool.cerrar_todas()
 
         loop.close()
         logger.info("✅ Servicio detenido correctamente")

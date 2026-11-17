@@ -436,7 +436,7 @@
         "x": 0,
         "y": 17
       },
-      "description": "Lo que el PLC está mandando en este momento, leído con la MISMA conexión del recolector. Se llena antes de cualquier decisión: aunque la parte se rechace o el contador no avance, aquí aparece. HACE(s) subiendo = el PLC dejó de responder.",
+      "description": "Lo que el PLC está mandando en este momento, leído con la MISMA conexión del recolector. Número, contador, ciclo y troquel son SIEMPRE lo leído en ese ciclo, tal cual (si manda 0 se ve 0); no es el contador que el recolector recuerda. ESTADO dice cómo leer la fila: 'En vivo' = el PLC lo manda ahora; 'Sin número de parte' = el PLC responde pero ese lado viene en blanco (se ve su contador actual, sin número); 'Rechazada' = manda un número que no se resolvió; 'PLC sin respuesta' = no llega lectura hace más de 30 s, así que las columnas del PLC salen vacías.",
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
         "uid": "infinity"
@@ -461,6 +461,11 @@
             {
               "selector": "lado",
               "text": "Lado",
+              "type": "string"
+            },
+            {
+              "selector": "estado",
+              "text": "Estado",
               "type": "string"
             },
             {
@@ -518,7 +523,28 @@
           "custom": {
             "align": "auto",
             "filterable": true
-          }
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "—",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "null": {
+                  "text": "—",
+                  "index": 1
+                }
+              }
+            }
+          ]
         },
         "overrides": [
           {
@@ -590,6 +616,46 @@
               {
                 "id": "custom.align",
                 "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Estado"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "En vivo": {
+                        "color": "green",
+                        "index": 0
+                      },
+                      "Sin número de parte": {
+                        "color": "blue",
+                        "index": 1
+                      },
+                      "Rechazada": {
+                        "color": "orange",
+                        "index": 2
+                      },
+                      "PLC sin respuesta": {
+                        "color": "red",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
               }
             ]
           }

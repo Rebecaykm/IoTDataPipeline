@@ -42,6 +42,7 @@ import logging
 from datetime import datetime
 
 from domain.ordenes import Capacidad, repartir
+from persistence.errores import es_interbloqueo
 from persistence.repositorio import obtener_part_number_id
 
 logger = logging.getLogger("supervisor")
@@ -444,11 +445,26 @@ def acumulador_no_planeado(cursor, estacion, numero_parte, fecha_plan,
         log.info(f"🆕 Acumulador sin orden {fila[0]} para {numero_parte} en {estacion}")
         return fila[0], None
     except Exception as e:
+        # El interbloqueo ya revirtió la transacción entera: devolverlo como
+        # un error más dejaría seguir el ciclo y confirmar solo lo de después.
+        if es_interbloqueo(e):
+            raise
         log.error(f"❌ Error creando acumulador para {numero_parte}: {e}")
         return None, "DB_ERROR"
 
 
 # ─────────────────────────────── orquestación ─────────────────────────────
+
+class RegistroIncompleto(Exception):
+    """
+    Parte del incremento ya se escribió y el resto no encontró dónde quedar.
+
+    Solo pasa por una carrera con otro proceso: una orden o el acumulador
+    cambiaron entre la consulta y la escritura. Confirmar lo ya escrito sin
+    mover la línea base haría que el siguiente ciclo lo registrara otra vez,
+    así que quien llama debe revertir la transacción completa.
+    """
+
 
 class Resultado:
     """Qué acabó pasando con un incremento del contador."""
@@ -488,9 +504,17 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
     que aquí no se conocen. Solo se invoca cuando hay algo que registrar: las
     piezas que sobran de una unidad ya contabilizada NO generan fila.
 
-    Garantía: la suma de lo escrito es siempre incremento x multiplicador. Lo
-    que no cabe en ninguna orden termina en el acumulador correspondiente,
-    nunca en la basura.
+    Garantía: o se escribe el incremento COMPLETO —incremento x multiplicador,
+    lo que no cabe en ninguna orden en el acumulador— o no se escribe nada:
+
+      - si se sabe de antemano que no hay dónde poner el sobrante, se devuelve
+        `error` sin haber tocado ninguna orden;
+      - si se descubre a media escritura (una carrera con otro proceso), se
+        lanza RegistroIncompleto para que quien llama revierta todo.
+
+    Antes las órdenes se llenaban primero y el sobrante fallaba después: esas
+    piezas quedaban confirmadas con la línea base sin mover, y el siguiente
+    ciclo las volvía a registrar enteras.
     """
     resultado = Resultado()
     if incremento <= 0:
@@ -498,6 +522,14 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
 
     disponibles = capacidades(cursor, estacion, numero_parte, fecha_plan)
     reparto = repartir(incremento, multiplicador, disponibles)
+
+    id_acumulador = None
+    if any(a.es_no_planeado for a in reparto):
+        id_acumulador, error = acumulador_no_planeado(
+            cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, flavor, log)
+        if id_acumulador is None:
+            return _sin_donde_registrar(resultado, error, incremento,
+                                        numero_parte, estacion, log)
 
     piezas_sueltas = 0   # lo que rebotó de alguna orden y hay que reubicar
     incremento_suelto = 0
@@ -548,17 +580,14 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
     if piezas_sueltas <= 0 and incremento_suelto <= 0:
         return resultado
 
-    # Lo que no cupo en ninguna orden.
-    id_acumulador, error = acumulador_no_planeado(
-        cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, flavor, log)
-
+    # Lo que no cupo en ninguna orden. Si el reparto no lo preveía, es que una
+    # orden se cerró entre la consulta y el UPDATE: el acumulador se pide aquí.
     if id_acumulador is None:
-        resultado.error = error
-        log.error(
-            f"❌ {piezas_sueltas} piezas de {numero_parte} en {estacion} sin dónde "
-            f"registrarse ({error})."
-        )
-        return resultado
+        id_acumulador, error = acumulador_no_planeado(
+            cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, flavor, log)
+        if id_acumulador is None:
+            return _sin_donde_registrar(resultado, error, incremento,
+                                        numero_parte, estacion, log)
 
     if sumar_a_no_planeado(cursor, id_acumulador, piezas_sueltas,
                            fecha_fmt, fecha_plan, flavor) is None:
@@ -574,13 +603,8 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
             fecha_fmt, flavor, log)
         if id_acumulador is None or sumar_a_no_planeado(
                 cursor, id_acumulador, piezas_sueltas, fecha_fmt, fecha_plan, flavor) is None:
-            resultado.error = error or "ACUMULADOR_NO_DISPONIBLE"
-            log.error(
-                f"❌ {piezas_sueltas} piezas de {numero_parte} en {estacion} sin dónde "
-                f"registrarse ({resultado.error}). La línea base no se mueve: "
-                f"el siguiente ciclo reintenta con el delta completo."
-            )
-            return resultado
+            return _sin_donde_registrar(resultado, error or "ACUMULADOR_NO_DISPONIBLE",
+                                        incremento, numero_parte, estacion, log)
 
     resultado.piezas += piezas_sueltas
     resultado.no_planeado = piezas_sueltas
@@ -597,5 +621,26 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
         f"📦 {piezas_sueltas} piezas de {numero_parte} en {estacion} sin orden "
         f"(de un avance de {incremento} este ciclo): van al acumulador "
         f"{id_acumulador} (régimen {regimen})."
+    )
+    return resultado
+
+
+def _sin_donde_registrar(resultado, error, incremento, numero_parte, estacion, log):
+    """
+    El sobrante no tiene dónde quedar. Si todavía no se escribió nada, se
+    reporta como error y la línea base no se mueve; si ya se escribió parte,
+    se aborta la transacción (ver RegistroIncompleto).
+    """
+    if resultado.piezas:
+        raise RegistroIncompleto(
+            f"{numero_parte} en {estacion}: {resultado.piezas} piezas ya escritas "
+            f"en órdenes y el resto sin dónde registrarse ({error}). Se revierte "
+            f"el ciclo completo; el siguiente reintenta con el delta completo."
+        )
+    resultado.error = error
+    log.error(
+        f"❌ {numero_parte} en {estacion}: un avance de {incremento} sin dónde "
+        f"registrarse ({error}). No se escribió nada: la línea base no se mueve "
+        f"y el siguiente ciclo reintenta con el delta completo."
     )
     return resultado

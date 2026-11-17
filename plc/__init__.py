@@ -1,8 +1,9 @@
 """
-Interpretación de lo que manda el PLC: decodificación de bloques y tags.
+Todo lo que tiene que ver con el PLC, sin base de datos:
 
-Igual que domain/, aquí no se importa pyodbc ni customtkinter. La lectura por
-socket vive en Prensas.py; esto solo traduce los words a algo legible.
+    cliente.py       la conexión MC protocol: lee tramas completas, descarta
+                     respuestas tardías y cierra con RST
+    decodificador.py traduce los words leídos a texto y agrupa los tags por lado
 """
 
 from plc.decodificador import decodificar_bloque, parse_tag

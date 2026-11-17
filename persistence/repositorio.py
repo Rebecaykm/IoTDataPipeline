@@ -11,11 +11,6 @@ import logging
 logger = logging.getLogger("supervisor")
 
 
-def _sin_multiplicador(cursor, numero_parte, estacion, log):
-    """Por defecto un golpe es una pieza. Estampado inyecta su propio lector."""
-    return 1
-
-
 # ─────────────────────────────── part_numbers ──────────────────────────────
 
 def obtener_part_number_id(cursor, numero_parte, estacion):

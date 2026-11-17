@@ -6,6 +6,8 @@ llena el disco. Con 109 estaciones creciendo al triple, un disco lleno detiene
 el recolector.
 """
 
+from logging.handlers import RotatingFileHandler
+
 import pytest
 
 import Prensas
@@ -137,3 +139,34 @@ class TestRotacion:
         """
         assert Prensas.LOG_MAX_BYTES <= 10 * 1024 * 1024
         assert Prensas.LOG_RESPALDOS >= 5
+
+
+def archivos_del_supervisor():
+    return [h for h in Prensas.logger.handlers if isinstance(h, RotatingFileHandler)]
+
+
+def nuevos_desde(antes):
+    """Los manejadores que agregó la prueba; los de pytest se quedan."""
+    return [h for h in Prensas.logger.handlers if h not in antes]
+
+
+class TestElLogDelServicioNoSeMezclaConPruebas:
+    def test_importar_el_modulo_no_abre_el_log_del_servicio(self):
+        """
+        Las pruebas importan Prensas. Si eso abriera logs/supervisor.log, cada
+        corrida de pruebas escribiría líneas falsas en el log real.
+        """
+        assert not archivos_del_supervisor()
+
+    def test_al_arrancar_se_configura_una_sola_vez(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Prensas, "LOGS_DIR", tmp_path)
+        antes = list(Prensas.logger.handlers)
+        try:
+            Prensas.configurar_logging()
+            Prensas.configurar_logging()
+            assert len(archivos_del_supervisor()) == 1, "sin duplicar líneas"
+            assert (tmp_path / "supervisor.log").exists()
+        finally:
+            for manejador in nuevos_desde(antes):
+                Prensas.logger.removeHandler(manejador)
+                manejador.close()

@@ -12,7 +12,7 @@ class ContextoArea:
     Lo que un área necesita del mundo exterior para resolver un número de parte.
 
     Se pasa como argumento en vez de importarse, para que las áreas no dependan
-    de AS400 ni de la base de datos directamente.
+    de la base de datos directamente.
     """
     estacion: str
     log: Any
@@ -32,6 +32,11 @@ class AreaPipeline:
     # `pieces_per_shot` y el multiplicador es siempre 1.
     usa_multiplicador = False
 
+    # Si traducir lo que manda el PLC consulta la base (el catálogo de MDI).
+    # El colector lo usa para sacar esa traducción del hilo que lee los PLC:
+    # una base lenta no debe congelar la lectura de toda la planta.
+    resuelve_en_catalogo = False
+
     def resolver_partes(self, raw: str, ctx: ContextoArea) -> Tuple[List[str], Optional[str]]:
         """
         Traduce lo que manda el PLC a números de parte reales.
@@ -49,10 +54,3 @@ class AreaPipeline:
         Columnas extra al registrar en histories. La base no agrega ninguna.
         """
         return {}
-
-    def requiere_validacion_bd(self) -> bool:
-        """
-        True si el número aún debe validarse contra part_numbers al crear el
-        registro. Estampado ya validó contra AS400 y SQL, así que devuelve False.
-        """
-        return True

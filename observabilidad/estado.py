@@ -144,11 +144,6 @@ class RegistroEstados:
         estados.sort(key=lambda e: (not e.requiere_atencion, e.estacion, e.lado))
         return [e.como_dict() for e in estados]
 
-    def areas(self):
-        """Áreas conocidas, para poblar el selector del tablero."""
-        with self._lock:
-            return sorted({e.area for e in self._estados.values() if e.area})
-
     def resumen(self, area=None, estacion=None):
         """Cifras para los recuadros de arriba del tablero."""
         with self._lock:

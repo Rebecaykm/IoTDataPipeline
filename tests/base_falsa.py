@@ -127,7 +127,7 @@ class BaseFalsa:
         if "INSERT INTO production_records" in sql:
             return self._crear_no_planeado(p[0], p[1], p[4])
         if "pieces_per_shot" in sql:
-            return self._multiplicador(p[1], p[2])
+            return self._multiplicador(p[1])
         if "FROM part_numbers pn" in sql:
             return self._part_number_id(p[1], p[0])
         if "INSERT INTO histories" in sql:
@@ -265,9 +265,12 @@ class BaseFalsa:
         self._siguiente_id += 1
         return [(nuevo.id,)]
 
-    def _multiplicador(self, numero, estacion):
-        """El atributo pieces_per_shot; ausente significa 1 pieza por golpe."""
-        valor = self.multiplicadores.get((estacion, numero.replace(" ", "")))
+    def _multiplicador(self, part_number_id):
+        """
+        El atributo pieces_per_shot de ESA fila; ausente significa 1 pieza por
+        golpe. Se busca por el id ya resuelto, como la consulta real.
+        """
+        valor = self.multiplicadores.get(self._ids_resueltos.get(part_number_id))
         return [(str(valor),)] if valor is not None else []
 
     def _part_number_id(self, estacion, numero):

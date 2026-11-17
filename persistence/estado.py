@@ -21,7 +21,8 @@ tuviera (se leía como corrida nueva): el número registrado era el mismo.
 
 Qué guarda cada entrada de `partes`:
     contador_registro  desde qué valor del contador se cuentan los deltas
-    multiplicador      piezas por golpe vigente (solo cambia en Estampado)
+    multiplicador      último pieces_per_shot usado (solo Estampado); sirve
+                       para avisar en el log cuando alguien lo corrige
     id_en_curso        la orden que se está llenando, para poder cerrarla si la
                        corrida termina de golpe
     numero_original    lo que mandó el PLC, sin resolver

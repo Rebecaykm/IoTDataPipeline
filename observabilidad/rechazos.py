@@ -12,7 +12,6 @@ cada rechazo cuesta una comparación en un set y, si toca escribir, una línea.
 
 import json
 import logging
-import os
 import threading
 from datetime import date, datetime
 from pathlib import Path
@@ -42,6 +41,11 @@ class RechazosStore:
         self._lock = threading.Lock()
         self._cargar_indice()
 
+    @property
+    def combinaciones(self):
+        """Cuántas combinaciones ya registradas conoce el índice."""
+        return len(self._vistos)
+
     def _cargar_indice(self):
         """Una sola lectura, al arrancar. Nunca más se relee el archivo."""
         if not self.path.exists():
@@ -59,7 +63,6 @@ class RechazosStore:
                                           r["fecha"]))
                     except (json.JSONDecodeError, KeyError):
                         continue  # línea corrupta: se ignora, no tumba el resto
-            logger.info(f"📋 Bitácora de rechazos: {len(self._vistos)} combinación(es) previas")
         except Exception as e:
             logger.error(f"Error leyendo la bitácora de rechazos: {e}")
 

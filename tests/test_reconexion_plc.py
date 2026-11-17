@@ -26,7 +26,7 @@ seguridad para el lado que todavía no tiene observación propia.
 import json
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pytest
 
