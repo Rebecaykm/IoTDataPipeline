@@ -18,6 +18,14 @@ LOG = logging.getLogger("test")
 AHORA = "2026-08-19 07:30:00"
 HOY = date(2026, 8, 19)
 MES_INICIO, MES_FIN = ord_sql.limites_mes(HOY)
+#: El mes completo: estación sin corte (No verificado) o con un corte ya
+#: pasado (No planeado), que es como están hoy todas las estaciones.
+MES = ord_sql.ventana_de(HOY, None)
+MES_24 = ord_sql.ventana_de(HOY, date(2000, 1, 1))
+#: Corte el 20-ago: lo del 19 solo puede ir a órdenes del 1 al 19.
+ANTES_DEL_CORTE = ord_sql.ventana_de(HOY, date(2026, 8, 20))
+#: Corte el 10-ago: lo del 19 solo puede ir a órdenes del 10 al 31.
+DESDE_EL_CORTE = ord_sql.ventana_de(HOY, date(2026, 8, 10))
 
 
 class TestCapacidades:
@@ -25,7 +33,7 @@ class TestCapacidades:
 
     def test_devuelve_las_ordenes_en_el_orden_de_la_consulta(self):
         cur = CursorFalso([[(101, "4051130", 60), (102, "4051131", 900)]])
-        caps = ord_sql.capacidades(cur, "MK05", "BDTS53411-BK", HOY)
+        caps = ord_sql.capacidades(cur, "MK05", "BDTS53411-BK", MES)
 
         assert [c.id_registro for c in caps] == [101, 102]
         assert [c.orden for c in caps] == ["4051130", "4051131"]
@@ -33,73 +41,82 @@ class TestCapacidades:
 
     def test_sin_ordenes_devuelve_lista_vacia(self):
         """No es un error: significa que la producción es sobrante (acumulador)."""
-        assert ord_sql.capacidades(CursorFalso([[]]), "MK05", "X", HOY) == []
+        assert ord_sql.capacidades(CursorFalso([[]]), "MK05", "X", MES) == []
 
     def test_pasa_estacion_parte_y_limites_del_mes(self):
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "BDTS53411-BK", HOY)
+        ord_sql.capacidades(cur, "MK05", "BDTS53411-BK", MES)
         assert cur.params == ("MK05", "BDTS53411-BK", MES_INICIO, MES_FIN)
+
+    def test_con_corte_dentro_del_mes_pasa_la_mitad_que_le_toca(self):
+        cur = CursorFalso([[]])
+        ord_sql.capacidades(cur, "MK05", "X", ANTES_DEL_CORTE)
+        assert cur.params == ("MK05", "X", date(2026, 8, 1), date(2026, 8, 20))
+
+        ord_sql.capacidades(cur, "MK05", "X", DESDE_EL_CORTE)
+        assert cur.params == ("MK05", "X", date(2026, 8, 10), date(2026, 9, 1))
 
     def test_la_orden_en_progreso_va_primero(self):
         """Retomar lo que se estaba llenando manda sobre la antigüedad."""
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "ORDER BY CASE WHEN pr.status_id = 7 THEN 0 ELSE 1 END" in cur.sql
 
     def test_luego_de_la_mas_antigua_a_la_mas_nueva(self):
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "pr.planned_date, pr.shift_id, pr.created_at" in cur.sql
 
     def test_descarta_las_ordenes_ya_llenas(self):
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "pr.produced_quantity < pr.planned_quantity" in cur.sql
 
     def test_las_pendientes_exigen_numero_de_orden(self):
         """Sin shop_order_number no es una orden: es otra cosa."""
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "pr.shop_order_number IS NOT NULL" in cur.sql
 
     def test_el_mismo_filtro_de_mes_aplica_a_la_orden_en_progreso(self):
         """
-        El filtro de mes es parejo para TODA la consulta, incluida la orden
-        en progreso: si queda en un mes distinto, el recolector simplemente
-        deja de verla -no la cierra ni la clasifica, eso es responsabilidad
-        del proceso externo que cierra el mes.
+        El filtro de la ventana es parejo para TODA la consulta, incluida la
+        orden en progreso: si queda en un mes distinto, el recolector
+        simplemente deja de verla -no la cierra ni la clasifica, eso es
+        responsabilidad del proceso externo que cierra el mes-; si queda del
+        otro lado del corte, ya la cerró cerrar_fuera_de_ventana().
         """
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "pr.planned_date >= ? AND pr.planned_date < ?" in cur.sql
         # Y esa condición no está anidada dentro de ninguna rama del OR:
         # aplica antes de distinguir status 7 de status 3/8.
         recorte = cur.sql[:cur.sql.index("AND ( pr.status_id")]
         assert "pr.planned_date >= ? AND pr.planned_date < ?" in recorte
 
-    def test_no_depende_del_sync_from_de_la_estacion(self):
+    def test_no_vuelve_a_leer_el_corte_de_la_estacion(self):
         """
-        El filtrado de órdenes es una sola regla sin excepción por régimen:
-        sync_from no participa aquí, solo decide el flavor del sobrante.
+        El corte llega ya convertido en ventana (ver ventana_de()): una sola
+        regla, decidida en un solo lugar, para órdenes y acumulador.
         """
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "infor_sync_work_centers" not in cur.sql
 
     def test_ignora_lo_ya_enviado_a_infor(self):
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "ISNULL(pr.synced_to_infor, 0) <> 1" in cur.sql
 
     def test_compara_el_numero_de_parte_sin_espacios(self):
         """'BDTS28BFC -P' y 'BDTS28BFC-P' son la misma parte en la base."""
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert "REPLACE(pn.number, ' ', '') = ?" in cur.sql
 
     def test_acota_cuantas_ordenes_trae(self):
         cur = CursorFalso([[]])
-        ord_sql.capacidades(cur, "MK05", "X", HOY)
+        ord_sql.capacidades(cur, "MK05", "X", MES)
         assert f"SELECT TOP({ord_sql.MAX_ORDENES})" in cur.sql
 
 
@@ -121,6 +138,68 @@ class TestLimitesMes:
     def test_febrero_de_anio_bisiesto(self):
         """2028 es bisiesto: el fin de febrero cae en el 1 de marzo sin caso especial."""
         assert ord_sql.limites_mes(date(2028, 2, 29)) == (date(2028, 2, 1), date(2028, 3, 1))
+
+
+class TestVentana:
+    """
+    El corte de la estación (sync_from) parte el mes en dos, sin traslape; el
+    mes sigue siendo el marco. Ejemplo pedido por Moisés: corte el 20-nov.
+    """
+
+    CORTE = date(2026, 11, 20)
+
+    def test_antes_del_corte_del_1_al_dia_previo_y_a_no_verificado(self):
+        assert ord_sql.ventana_de(date(2026, 11, 19), self.CORTE) == (
+            date(2026, 11, 1), date(2026, 11, 20), ord_sql.NO_VERIFICADO)
+
+    def test_el_dia_del_corte_ya_es_del_corte_en_adelante(self):
+        assert ord_sql.ventana_de(date(2026, 11, 20), self.CORTE) == (
+            date(2026, 11, 20), date(2026, 12, 1), ord_sql.NO_PLANEADO)
+
+    def test_despues_del_corte_nunca_pasa_del_fin_de_mes(self):
+        """El mes también se respeta: una orden de diciembre no es de noviembre."""
+        assert ord_sql.ventana_de(date(2026, 11, 28), self.CORTE) == (
+            date(2026, 11, 20), date(2026, 12, 1), ord_sql.NO_PLANEADO)
+
+    def test_el_mes_siguiente_es_el_mes_completo(self):
+        assert ord_sql.ventana_de(date(2026, 12, 3), self.CORTE) == (
+            date(2026, 12, 1), date(2027, 1, 1), ord_sql.NO_PLANEADO)
+
+    def test_el_mes_anterior_es_el_mes_completo_en_no_verificado(self):
+        assert ord_sql.ventana_de(date(2026, 10, 15), self.CORTE) == (
+            date(2026, 10, 1), date(2026, 11, 1), ord_sql.NO_VERIFICADO)
+
+    def test_sin_corte_el_mes_completo_en_no_verificado(self):
+        """Así quedan las estaciones sin fila en infor_sync_work_centers: como hoy."""
+        assert ord_sql.ventana_de(date(2026, 11, 19), None) == (
+            date(2026, 11, 1), date(2026, 12, 1), ord_sql.NO_VERIFICADO)
+
+    def test_corte_de_un_mes_pasado_el_mes_completo_en_no_planeado(self):
+        """Así quedan las 26 estaciones con corte el 21-sep: como hoy."""
+        assert ord_sql.ventana_de(date(2026, 11, 19), date(2026, 9, 21)) == (
+            date(2026, 11, 1), date(2026, 12, 1), ord_sql.NO_PLANEADO)
+
+    def test_corte_el_dia_primero_no_parte_nada(self):
+        assert ord_sql.ventana_de(date(2026, 11, 19), date(2026, 11, 1)) == (
+            date(2026, 11, 1), date(2026, 12, 1), ord_sql.NO_PLANEADO)
+        assert ord_sql.ventana_de(date(2026, 10, 31), date(2026, 11, 1)) == (
+            date(2026, 10, 1), date(2026, 11, 1), ord_sql.NO_VERIFICADO)
+
+    def test_cruce_de_anio(self):
+        assert ord_sql.ventana_de(date(2026, 12, 31), date(2026, 12, 20)) == (
+            date(2026, 12, 20), date(2027, 1, 1), ord_sql.NO_PLANEADO)
+
+    @pytest.mark.parametrize("fecha_plan,corte,parte", [
+        (date(2026, 11, 19), date(2026, 11, 20), True),
+        (date(2026, 11, 20), date(2026, 11, 20), True),
+        (date(2026, 11, 19), None, False),
+        (date(2026, 11, 19), date(2026, 9, 21), False),
+        (date(2026, 11, 19), date(2026, 12, 5), False),
+        (date(2026, 11, 19), date(2026, 11, 1), False),
+        (date(2026, 12, 3), date(2026, 11, 20), False),
+    ])
+    def test_corta_el_mes_solo_si_el_corte_cae_dentro(self, fecha_plan, corte, parte):
+        assert ord_sql.ventana_de(fecha_plan, corte).corta_el_mes is parte
 
 
 class TestObtenerSyncFrom:
@@ -320,11 +399,60 @@ class TestDetener:
         assert "planned_date" not in recorte_where
 
 
+class TestCerrarFueraDeVentana:
+    """
+    Al cruzar el corte, lo que la parte dejó En progreso del otro lado (en el
+    mismo mes) se cierra como cualquier fin de corrida: orden a Detenido,
+    acumulador a 14 o 24 según el corte.
+    """
+
+    def test_busca_solo_lo_que_esta_en_progreso(self):
+        cur = CursorFalso([[]])
+        ord_sql.cerrar_fuera_de_ventana(cur, "MK05", "X", DESDE_EL_CORTE, AHORA, log=LOG)
+        assert f"AND pr.status_id = {ord_sql.EN_PROGRESO}" in cur.sql
+
+    def test_mismo_mes_pero_fuera_de_la_ventana(self):
+        """Lo de otro mes no es asunto de este cierre (ver capacidades())."""
+        cur = CursorFalso([[]])
+        ord_sql.cerrar_fuera_de_ventana(cur, "MK05", "X", DESDE_EL_CORTE, AHORA, log=LOG)
+        assert ("AND pr.planned_date >= ? AND pr.planned_date < ? "
+                "AND NOT (pr.planned_date >= ? AND pr.planned_date < ?)") in cur.sql
+        assert cur.params == ("MK05", "X", MES_INICIO, MES_FIN,
+                              date(2026, 8, 10), date(2026, 9, 1))
+
+    def test_solo_esta_parte_en_esta_estacion(self):
+        cur = CursorFalso([[]])
+        ord_sql.cerrar_fuera_de_ventana(cur, "MK05", "X", ANTES_DEL_CORTE, AHORA, log=LOG)
+        assert "WHERE wc.name = ? AND REPLACE(pn.number, ' ', '') = ?" in cur.sql
+
+    def test_si_no_hay_nada_del_otro_lado_solo_lee(self):
+        """Lo normal mientras el corte parte el mes: una lectura y nada más."""
+        cur = CursorFalso([[]])
+        assert ord_sql.cerrar_fuera_de_ventana(
+            cur, "MK05", "X", ANTES_DEL_CORTE, AHORA, log=LOG) == 0
+        assert len(cur) == 1
+        assert cur.sql.startswith("SELECT")
+
+    def test_cierra_cada_uno_con_detener(self, caplog):
+        """El mismo cierre que cualquier fin de corrida, no una regla aparte."""
+        cur = CursorFalso([[(501, "4051130"), (502, None)], [(501,)], [(502,)]])
+        with caplog.at_level(logging.INFO, logger="test"):
+            assert ord_sql.cerrar_fuera_de_ventana(
+                cur, "MK05", "X", DESDE_EL_CORTE, AHORA, log=LOG) == 2
+
+        assert cur.sql_de(1) == cur.sql_de(2)
+        assert "WHERE pr.id = ? AND pr.status_id = 7" in cur.sql_de(1)
+        assert cur.params_de(1) == (AHORA, 501)
+        assert cur.params_de(2) == (AHORA, 502)
+        assert "la orden 4051130 (registro 501)" in caplog.text
+        assert "el acumulador (registro 502)" in caplog.text
+
+
 class TestAcumuladorNoPlaneado:
     def test_reutiliza_el_que_ya_existe(self):
         cur = CursorFalso([[(777,)]])
         assert ord_sql.acumulador_no_planeado(
-            cur, "MK05", "X", HOY, 1, AHORA, log=LOG) == (777, None)
+            cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG) == (777, None)
         assert len(cur) == 1, "no debe insertar si ya existe"
 
     def test_lo_crea_cuando_no_hay(self):
@@ -332,7 +460,7 @@ class TestAcumuladorNoPlaneado:
         # 3) resuelve el part_number_id -> 123. 4) crea.
         cur = CursorFalso([[], [], [(123,)], [(888,)]])
         assert ord_sql.acumulador_no_planeado(
-            cur, "MK05", "X", HOY, 1, AHORA, log=LOG) == (888, None)
+            cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG) == (888, None)
         assert "INSERT INTO production_records" in cur.sql
         assert cur.params == (123, 1, AHORA, AHORA, HOY)
 
@@ -344,7 +472,7 @@ class TestAcumuladorNoPlaneado:
         part_number_id distinto para la misma producción.
         """
         cur = CursorFalso([[], [], [(123,)], [(888,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert "pn.is_obsolete = 0" in cur.sql_de(2)
         assert cur.params_de(2) == ("X", "MK05")
 
@@ -355,7 +483,7 @@ class TestAcumuladorNoPlaneado:
         falla.
         """
         cur = CursorFalso([[], [], [(123,)], [(888,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert f", {ord_sql.EN_PROGRESO}, ?" in cur.sql
         assert f", {ord_sql.NO_PLANEADO}, ?" not in cur.sql
 
@@ -365,7 +493,7 @@ class TestAcumuladorNoPlaneado:
         vacío y todo entra por sumar_a_no_planeado.
         """
         cur = CursorFalso([[], [], [(123,)], [(888,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert "VALUES (?, 0, ?" in cur.sql
 
     def test_busca_uno_solo_por_parte_y_estacion(self):
@@ -374,7 +502,7 @@ class TestAcumuladorNoPlaneado:
         parte se junta toda en el mismo renglón dentro de ese mes.
         """
         cur = CursorFalso([[(777,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert "pr.shop_order_number IS NULL" in cur.sql
         assert "pr.shift_id" not in cur.sql, "el turno no acota la búsqueda"
 
@@ -386,25 +514,40 @@ class TestAcumuladorNoPlaneado:
         renglón.
         """
         cur = CursorFalso([[(777,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert "pr.planned_date >= ? AND pr.planned_date < ?" in cur.sql
         assert cur.params == ("MK05", "X", ord_sql.NO_PLANEADO, MES_INICIO, MES_FIN)
 
     def test_el_flavor_decide_que_status_cerrado_cuenta_como_mio(self):
         cur = CursorFalso([[(777,)]])
         ord_sql.acumulador_no_planeado(
-            cur, "MK05", "X", HOY, 1, AHORA, flavor=ord_sql.NO_VERIFICADO, log=LOG)
+            cur, "MK05", "X", HOY, 1, AHORA, MES, log=LOG)
         assert cur.params == ("MK05", "X", ord_sql.NO_VERIFICADO, MES_INICIO, MES_FIN)
+
+    def test_con_corte_busca_solo_en_su_mitad_del_mes(self):
+        cur = CursorFalso([[(777,)]])
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, ANTES_DEL_CORTE, log=LOG)
+        assert cur.params == ("MK05", "X", ord_sql.NO_VERIFICADO, date(2026, 8, 1), date(2026, 8, 20))
+
+    def test_el_vencido_se_sigue_buscando_fuera_del_mes_no_de_la_ventana(self):
+        """
+        El vencido es el de OTRO mes. El del otro lado del corte, en este mes,
+        ya lo cerró cerrar_fuera_de_ventana() antes de llegar aquí.
+        """
+        cur = CursorFalso([[], [], [(123,)], [(888,)]])
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, DESDE_EL_CORTE, log=LOG)
+        assert "NOT (" in cur.sql_de(1)
+        assert cur.params_de(1) == ("MK05", "X", MES_INICIO, MES_FIN)
 
     def test_si_hay_varios_toma_el_mas_reciente(self):
         cur = CursorFalso([[(777,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert "ORDER BY pr.id DESC" in cur.sql
 
     def test_parte_inexistente_devuelve_error_para_el_tablero(self):
         cur = CursorFalso([[], [], []])
         id_reg, error = ord_sql.acumulador_no_planeado(
-            cur, "MK05", "FANTASMA", HOY, 1, AHORA, log=LOG)
+            cur, "MK05", "FANTASMA", HOY, 1, AHORA, MES_24, log=LOG)
         assert id_reg is None
         assert error == "PART_NUMBER_NO_EXISTE_BD"
 
@@ -419,7 +562,7 @@ class TestAcumuladorNoPlaneado:
         # part_number_id -> 123 (para que SÍ se llegue a intentar el INSERT,
         # que es donde se simula el error de base).
         id_reg, error = ord_sql.acumulador_no_planeado(
-            CursorRoto([[], [], [(123,)]]), "MK05", "X", HOY, 1, AHORA, log=LOG)
+            CursorRoto([[], [], [(123,)]]), "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert (id_reg, error) == (None, "DB_ERROR")
 
 
@@ -436,14 +579,14 @@ class TestAcumuladorVencido:
         # part_number_id -> 123. 5) crea el del mes nuevo.
         cur = CursorFalso([[], [(555,)], [], [(123,)], [(888,)]])
         id_reg, error = ord_sql.acumulador_no_planeado(
-            cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+            cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert (id_reg, error) == (888, None)
         assert "NOT (" in cur.sql_de(1)
         assert cur.params_de(2) == (AHORA, 555)   # el detener() sobre el vencido
 
     def test_sin_vencido_no_dispara_ningun_cierre_de_mas(self):
         cur = CursorFalso([[], [], [(123,)], [(888,)]])
-        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, log=LOG)
+        ord_sql.acumulador_no_planeado(cur, "MK05", "X", HOY, 1, AHORA, MES_24, log=LOG)
         assert len(cur) == 4, "sin vencido no hay UPDATE de cierre de más"
 
 

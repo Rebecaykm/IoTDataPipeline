@@ -1,7 +1,7 @@
 """
 Una base de datos en memoria que entiende las consultas de persistence.ordenes.
 
-No pretende ser SQL Server: implementa exactamente las ocho consultas que el
+No pretende ser SQL Server: implementa exactamente las consultas que el
 recolector usa, con su misma semántica (el tope del UPDATE, el WHERE que impide
 cerrar una orden a medias). A cambio, las pruebas pueden afirmar sobre el
 ESTADO FINAL de los registros —"la orden quedó en 900 y Completada"— en vez de
@@ -116,6 +116,8 @@ class BaseFalsa:
             return self._detener(p[1], p[0])
         if "UPDATE pr SET" in sql:
             return self._detener_estacion(p[1], p[0])
+        if "SELECT pr.id, pr.shop_order_number" in sql and "NOT (" in sql:
+            return self._vivos_fuera_de_ventana(*p)
         if "NOT (" in sql:
             return self._buscar_vencido(*p)
         if "infor_sync_work_centers" in sql:
@@ -154,14 +156,14 @@ class BaseFalsa:
             registro.status = nuevo
 
     # ── implementación de cada consulta ───────────────────────────────────
-    def _capacidades(self, estacion, numero, mes_inicio, mes_fin):
+    def _capacidades(self, estacion, numero, desde, hasta):
         vivas = [
             r for r in self.registros.values()
             if r.estacion == estacion
             and r.numero == numero.replace(" ", "")
             and (r.synced or 0) != 1
             and r.produced < r.planned
-            and _fecha(mes_inicio) <= r.planned_date < _fecha(mes_fin)
+            and _fecha(desde) <= r.planned_date < _fecha(hasta)
             and (r.status == ord_sql.EN_PROGRESO
                  or (r.status in (ord_sql.PENDIENTE, ord_sql.DETENIDO)
                      and r.orden is not None))
@@ -221,13 +223,22 @@ class BaseFalsa:
             r.production_end = fecha
         return [(r.id,) for r in tocados]
 
-    def _buscar_no_planeado(self, estacion, numero, flavor, mes_inicio, mes_fin):
+    def _vivos_fuera_de_ventana(self, estacion, numero, mes_inicio, mes_fin, desde, hasta):
+        """Lo que la parte dejó En progreso del otro lado del corte, en el mismo mes."""
+        return [(r.id, r.orden) for r in self.registros.values()
+                if r.estacion == estacion
+                and r.numero == numero.replace(" ", "")
+                and r.status == ord_sql.EN_PROGRESO
+                and _fecha(mes_inicio) <= r.planned_date < _fecha(mes_fin)
+                and not (_fecha(desde) <= r.planned_date < _fecha(hasta))]
+
+    def _buscar_no_planeado(self, estacion, numero, flavor, desde, hasta):
         candidatos = [r for r in self.registros.values()
                       if r.estacion == estacion
                       and r.numero == numero.replace(" ", "")
                       and r.orden is None
                       and r.status in (ord_sql.EN_PROGRESO, flavor)
-                      and _fecha(mes_inicio) <= r.planned_date < _fecha(mes_fin)]
+                      and _fecha(desde) <= r.planned_date < _fecha(hasta)]
         candidatos.sort(key=lambda r: r.id, reverse=True)
         return [(candidatos[0].id,)] if candidatos else []
 

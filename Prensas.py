@@ -1420,12 +1420,12 @@ class IPDataProcessor:
                             f"corrida de las partes ausentes para no perder su contador base."
                         )
 
-                    # Régimen del sobrante para este ciclo (ver más abajo):
-                    # se calcula perezosamente, una sola vez, justo antes del
-                    # primer incremento real que haya que registrar. Calcularlo
-                    # aquí arriba costaría una consulta en cada ciclo, incluso
-                    # en los que ninguna parte avanzó.
-                    flavor = None
+                    # Corte de la estación para este ciclo (ver más abajo): se
+                    # lee perezosamente, una sola vez, justo antes del primer
+                    # incremento real que haya que registrar. Leerlo aquí
+                    # arriba costaría una consulta en cada ciclo, incluso en
+                    # los que ninguna parte avanzó.
+                    sync_from, sync_from_leido = None, False
 
                     for d in datos:
                         num = d['parte']
@@ -1642,22 +1642,19 @@ class IPDataProcessor:
                                               {'troquel_id': _troquel}, log,
                                               shop_order_number=orden_num)
 
-                        if flavor is None:
+                        if not sync_from_leido:
                             # Corte por estación, leído fresco en cada ciclo: se
                             # edita desde una interfaz web ajena a este repo y
-                            # debe surtir efecto sin reiniciar el servicio. Sin
-                            # fila, o antes de esa fecha, el sobrante va a la
-                            # cuarentena (No verificado); ya pasado el corte, al
-                            # flujo de siempre (No planeado).
+                            # debe surtir efecto sin reiniciar el servicio. Decide
+                            # qué órdenes se pueden llenar y a qué régimen va el
+                            # sobrante (ver ordenes.ventana_de()).
                             sync_from = ordenes.obtener_sync_from(cursor, estacion)
-                            flavor = (ordenes.NO_PLANEADO
-                                      if sync_from is not None and fecha_plan >= sync_from
-                                      else ordenes.NO_VERIFICADO)
+                            sync_from_leido = True
 
                         resultado = ordenes.registrar_incremento(
                             cursor, estacion, num, incremento, multiplicador,
                             fecha_plan=fecha_plan, turno=turno, fecha_fmt=fecha_fmt,
-                            flavor=flavor, anotar_history=anotar_historial, log=log,
+                            sync_from=sync_from, anotar_history=anotar_historial, log=log,
                         )
 
                         if resultado.error:

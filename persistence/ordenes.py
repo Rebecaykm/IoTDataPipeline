@@ -6,13 +6,21 @@ El modelo: la producción ya no se acumula por día y turno, sino que LLENA
 parte en esa estación, la llena, y cuando llega a lo planeado la cierra y sigue
 con la siguiente.
 
-Prioridad al buscar dónde registrar, siempre dentro del MISMO MES que la
-producción que se está registrando (nunca se avanza ni se retrocede de mes):
+Prioridad al buscar dónde registrar, siempre dentro de la VENTANA de la
+producción que se está registrando (ver ventana_de()): su mismo mes, partido en
+dos por el corte de la estación si ese corte cae dentro del mes. Nunca se
+avanza ni se retrocede de mes, y nunca se cruza el corte:
 
-    1º  status 7   la orden que ya se estaba llenando, de este mes
-    2º  status 3/8 con orden, de este mes, de la más antigua a la más nueva
-    3º  status 7/24 o 7/14  el acumulador de esa parte+estación+mes
+    1º  status 7   la orden que ya se estaba llenando, dentro de la ventana
+    2º  status 3/8 con orden, dentro de la ventana, de la más antigua a la más nueva
+    3º  status 7/24 o 7/14  el acumulador de esa parte+estación, dentro de la ventana
     4º               se crea el acumulador, también En progreso
+
+El corte es `sync_from`, una fecha por estación en infor_sync_work_centers. Con
+corte el 20-nov, lo producido hasta el 19 llena solo órdenes del 1 al 19 y su
+sobrante va a No verificado; lo producido desde el 20 llena solo órdenes del 20
+al 30 y su sobrante va a No planeado. En diciembre ya no parte nada: el mes
+completo, como siempre. Sin corte, el mes completo y No verificado.
 
 Estados de production_records:
     3  = Pendiente (el programa de producción)
@@ -39,7 +47,8 @@ multiplicador es 1 y ambas tablas van en piezas.
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
+from typing import NamedTuple
 
 from domain.ordenes import Capacidad, repartir
 from persistence.errores import es_interbloqueo
@@ -69,17 +78,54 @@ def limites_mes(fecha_plan):
     """
     [primer_día_del_mes, primer_día_del_mes_siguiente) que contiene fecha_plan.
 
-    Es el único filtro de fecha para llenar órdenes (ver capacidades()) y para
-    adoptar o crear el acumulador de sobrante (ver acumulador_no_planeado()):
-    nunca se cruza de mes, hacia adelante ni hacia atrás, sea cual sea el
-    régimen de la estación. `>=` y `<` sobre planned_date son sargables;
-    YEAR()/MONTH() sobre la columna no lo serían.
+    Es el marco de ventana_de(): nunca se cruza de mes, hacia adelante ni hacia
+    atrás, sea cual sea el corte de la estación. `>=` y `<` sobre planned_date
+    son sargables; YEAR()/MONTH() sobre la columna no lo serían.
     """
     inicio = fecha_plan.replace(day=1)
     mes_siguiente = inicio.month % 12 + 1
     anio_siguiente = inicio.year + (1 if inicio.month == 12 else 0)
     fin = inicio.replace(year=anio_siguiente, month=mes_siguiente)
     return inicio, fin
+
+
+class Ventana(NamedTuple):
+    """
+    Dónde puede quedar la producción de un día: planned_date en [desde, hasta),
+    y el régimen (`flavor`) de lo que no quepa en ninguna orden.
+    """
+    desde: date
+    hasta: date
+    flavor: int
+
+    @property
+    def corta_el_mes(self):
+        """El corte de la estación cae dentro de este mes y le quita un pedazo."""
+        return (self.desde, self.hasta) != limites_mes(self.desde)
+
+
+def ventana_de(fecha_plan, sync_from):
+    """
+    La ventana de la producción de `fecha_plan` (la fecha del TURNO) según el
+    corte de su estación, `sync_from` (None si la estación no tiene).
+
+    El mes es siempre el marco; el corte solo sube el piso o baja el techo
+    dentro de él, sin que las dos mitades se traslapen:
+
+        sin corte                    el mes completo          No verificado
+        fecha_plan antes del corte   del 1 al día previo      No verificado
+        fecha_plan desde el corte    del corte al fin de mes  No planeado
+
+    Ej., corte el 20-nov: lo del 19 (incluida la madrugada del 20, que es del
+    turno del 19) va a órdenes del 1 al 19; lo del 20 al 30, a órdenes del 20 al
+    30. Un corte de un mes pasado o futuro deja el mes completo.
+    """
+    inicio, fin = limites_mes(fecha_plan)
+    if sync_from is None:
+        return Ventana(inicio, fin, NO_VERIFICADO)
+    if fecha_plan < sync_from:
+        return Ventana(inicio, min(fin, sync_from), NO_VERIFICADO)
+    return Ventana(max(inicio, sync_from), fin, NO_PLANEADO)
 
 
 # ──────────────────────────────── lectura ─────────────────────────────────
@@ -108,22 +154,23 @@ ORDER BY CASE WHEN pr.status_id = {EN_PROGRESO} THEN 0 ELSE 1 END,
 """
 
 
-def capacidades(cursor, estacion, numero_parte, fecha_plan):
+def capacidades(cursor, estacion, numero_parte, ventana):
     """
     Órdenes abiertas de esta parte en esta estación, en orden de prioridad.
 
-    El filtro de fecha es SIEMPRE "mismo mes que fecha_plan" (ver
-    limites_mes()): nunca se avanza a un mes futuro ni se retrocede a uno
-    pasado, sin excepción — ni siquiera para la orden que ya se estaba
-    llenando (status 7). Si esa orden queda en un mes distinto, el recolector
-    simplemente deja de verla; no la cierra ni la toca, eso es
-    responsabilidad del proceso externo que cierra el mes.
+    El filtro de fecha es SIEMPRE la ventana (ver ventana_de()): el mismo mes, y
+    del lado del corte que le toca. Sin excepción, ni siquiera para la orden
+    que ya se estaba llenando (status 7):
+      - si esa orden queda en un mes distinto, el recolector simplemente deja
+        de verla; no la cierra ni la toca, eso es responsabilidad del proceso
+        externo que cierra el mes;
+      - si queda del otro lado del corte, en el mismo mes, ya la cerró
+        cerrar_fuera_de_ventana().
 
     Devuelve la lista que consume domain.ordenes.repartir(). Vacía significa
     "no hay dónde registrar": la producción es sobrante (acumulador).
     """
-    mes_inicio, mes_fin = limites_mes(fecha_plan)
-    cursor.execute(SQL_CAPACIDADES, (estacion, numero_parte, mes_inicio, mes_fin))
+    cursor.execute(SQL_CAPACIDADES, (estacion, numero_parte, ventana.desde, ventana.hasta))
     return [Capacidad(id_registro=f[0], orden=f[1], falta=int(f[2] or 0))
             for f in cursor.fetchall()]
 
@@ -220,10 +267,11 @@ def sumar_a_no_planeado(cursor, id_registro, piezas, fecha_fmt, fecha_plan,
     Aquí NO hay tope: no existe cantidad planeada contra la cual recortar, y
     recortar contra un planned_quantity vacío borraría producción real.
 
-    El acumulador es uno por parte+estación+mes y vive en status En progreso
-    mientras recibe producción, sin importar el régimen (`flavor`); solo se
-    cierra —a No planeado o a No verificado, según corresponda— cuando la
-    corrida termina (ver detener()). Sus fechas se mueven con él:
+    El acumulador es uno por parte+estación y ventana (ver ventana_de()) y vive
+    en status En progreso mientras recibe producción, sin importar el régimen
+    (`flavor`); solo se cierra —a No planeado o a No verificado, según
+    corresponda— cuando la corrida termina (ver detener()). Sus fechas se
+    mueven con él:
 
         planned_date       el día en que se produjo lo último
         production_start   cuándo empezó la corrida actual: si el registro
@@ -327,6 +375,56 @@ def detener_estacion(cursor, estacion, fecha_fmt):
     return cursor.rowcount
 
 
+SQL_VIVOS_FUERA_DE_VENTANA = f"""
+SELECT pr.id, pr.shop_order_number
+FROM production_records pr
+JOIN part_numbers pn ON pr.part_number_id = pn.id
+JOIN work_centers wc ON pn.work_center_id = wc.id
+WHERE wc.name = ?
+  AND REPLACE(pn.number, ' ', '') = ?
+  AND pr.status_id = {EN_PROGRESO}
+  AND pr.planned_date >= ? AND pr.planned_date < ?
+  AND NOT (pr.planned_date >= ? AND pr.planned_date < ?)
+"""
+
+
+def cerrar_fuera_de_ventana(cursor, estacion, numero_parte, ventana, fecha_fmt, log=logger):
+    """
+    Al cruzar el corte de la estación, cierra lo que esta parte dejó En progreso
+    del otro lado del corte, dentro del mismo mes, con detener(): la orden pasa
+    a Detenido y el acumulador a No verificado (o a No planeado), igual que en
+    cualquier fin de corrida. Su producción no se mueve.
+
+    Primero solo busca (una lectura, como la de capacidades()), y escribe
+    únicamente si encontró algo: eso pasa una vez, al cruzar el corte.
+
+    Ej., corte el 20-nov: a las 08:00 del 20 la prensa venía llenando la orden
+    del 18 (En progreso). Desde ahí ya no puede llenarla, así que se cierra
+    Detenida y lo que sigue va a las órdenes del 20 en adelante. Sin esto se
+    quedaría en 7, porque el fin de corrida solo cierra el registro que se está
+    llenando.
+
+    Lo de OTRO mes no se toca aquí. Una orden de otro mes la cierra el proceso
+    externo del cierre de mes, y un acumulador de otro mes lo cierra
+    acumulador_no_planeado() antes de abrir el de este.
+
+    Solo hace falta cuando el corte cae dentro del mes (Ventana.corta_el_mes);
+    quien llama se ahorra la consulta en cualquier otro caso.
+    """
+    mes_inicio, mes_fin = limites_mes(ventana.desde)
+    cursor.execute(SQL_VIVOS_FUERA_DE_VENTANA,
+                   (estacion, numero_parte, mes_inicio, mes_fin, ventana.desde, ventana.hasta))
+    vivos = cursor.fetchall()
+    for id_registro, orden in vivos:
+        detener(cursor, id_registro, fecha_fmt)
+        log.info(
+            f"✂️ Corte de {estacion}: {numero_parte} cruzó la fecha de la estación; "
+            f"{'la orden ' + orden if orden else 'el acumulador'} (registro {id_registro}) "
+            f"quedó del otro lado y se cierra como fin de corrida."
+        )
+    return len(vivos)
+
+
 # ───────────────────────────── no planeado ────────────────────────────────
 
 SQL_SYNC_FROM = """
@@ -390,29 +488,32 @@ VALUES (?, 0, ?, ?, ?, {EN_PROGRESO}, ?)
 
 
 def acumulador_no_planeado(cursor, estacion, numero_parte, fecha_plan,
-                           turno, fecha_fmt, flavor=NO_PLANEADO, log=logger):
+                           turno, fecha_fmt, ventana, log=logger):
     """
-    Devuelve el acumulador de sobrante de esta parte+estación+mes, creándolo
-    la primera vez.
+    Devuelve el acumulador de sobrante de esta parte+estación en su ventana,
+    creándolo la primera vez.
 
-    Es uno por parte+estación+MES (antes era "para siempre"): el rollover de
-    mes es automático, nadie tiene que cerrar nada a mano — ver el paso 2 de
-    abajo, que es justo lo que hace ese cierre cuando la corrida nunca "soltó"
-    la parte en el PLC al cruzar de mes.
+    Es uno por parte+estación y ventana: el mes (antes era "para siempre"), o
+    la mitad del mes que le toca si la estación tiene corte dentro de él. El
+    rollover de mes es automático, nadie tiene que cerrar nada a mano — ver el
+    paso 2 de abajo, que es justo lo que hace ese cierre cuando la corrida nunca
+    "soltó" la parte en el PLC al cruzar de mes.
 
-    `flavor` (NO_PLANEADO o NO_VERIFICADO) decide a cuál de los dos regímenes
-    pertenece el acumulador que se busca/crea; mientras está vivo siempre es
-    En progreso (ver sumar_a_no_planeado), y se cierra —a 24 o a 14, según el
-    sync_from de la estación— exactamente igual que cualquier corrida (ver
-    detener()).
+    `ventana.flavor` (NO_PLANEADO o NO_VERIFICADO) decide a cuál de los dos
+    regímenes pertenece el acumulador que se busca/crea; mientras está vivo
+    siempre es En progreso (ver sumar_a_no_planeado), y se cierra —a 24 o a 14,
+    según el sync_from de la estación— exactamente igual que cualquier corrida
+    (ver detener()).
 
     Pasos:
-      1. ¿Ya hay uno de ESTE mes y este régimen (vivo o ya cerrado)? Se
+      1. ¿Ya hay uno en ESTA ventana y este régimen (vivo o ya cerrado)? Se
          reutiliza.
       2. ¿Quedó uno VIVO de un mes anterior, porque la corrida nunca se
          detectó como terminada? Se cierra con detener() (mismo criterio que
-         cualquier fin de corrida) antes de seguir.
-      3. Se crea uno nuevo para este mes, En progreso, en cero.
+         cualquier fin de corrida) antes de seguir. El que quedó vivo del otro
+         lado del corte, en este mismo mes, ya lo cerró cerrar_fuera_de_ventana().
+      3. Se crea uno nuevo, En progreso, en cero, con planned_date = fecha_plan
+         (dentro de la ventana).
 
     Devuelve (id_registro, error). El error es un código para el tablero de
     rechazos cuando la parte ni siquiera existe en el catálogo.
@@ -420,7 +521,7 @@ def acumulador_no_planeado(cursor, estacion, numero_parte, fecha_plan,
     mes_inicio, mes_fin = limites_mes(fecha_plan)
 
     cursor.execute(SQL_BUSCAR_NO_PLANEADO,
-                   (estacion, numero_parte, flavor, mes_inicio, mes_fin))
+                   (estacion, numero_parte, ventana.flavor, ventana.desde, ventana.hasta))
     fila = cursor.fetchone()
     if fila:
         return fila[0], None
@@ -487,7 +588,7 @@ class Resultado:
 
 
 def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicador,
-                         fecha_plan, turno, fecha_fmt, flavor=NO_PLANEADO,
+                         fecha_plan, turno, fecha_fmt, sync_from,
                          anotar_history=None, log=logger):
     """
     Registra un incremento del contador llenando órdenes.
@@ -495,9 +596,12 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
     Es el único camino por el que entra producción a la base. Lee las órdenes
     abiertas, deja que domain.ordenes.repartir() decida el reparto, y escribe.
 
-    `flavor` (NO_PLANEADO o NO_VERIFICADO) decide a qué régimen de acumulador
-    va el sobrante sin orden, según si la estación ya pasó su `sync_from`
-    (lo decide quien llama, una vez por estación por ciclo).
+    `sync_from` es el corte de la estación (None si no tiene), y lo lee quien
+    llama, fresco, una vez por estación por ciclo. De él y de `fecha_plan` sale
+    la ventana (ver ventana_de()): qué órdenes se pueden llenar y a qué régimen
+    va el sobrante sin orden. Si el corte cae dentro del mes, antes de nada se
+    cierra lo que esta parte dejó En progreso del otro lado
+    (ver cerrar_fuera_de_ventana()).
 
     `anotar_history(id_registro, orden, incremento)` lo pone quien llama, porque
     el detalle de histories depende del área (el troquel en Estampado) y de datos
@@ -520,13 +624,16 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
     if incremento <= 0:
         return resultado
 
-    disponibles = capacidades(cursor, estacion, numero_parte, fecha_plan)
+    ventana = ventana_de(fecha_plan, sync_from)
+    if ventana.corta_el_mes:
+        cerrar_fuera_de_ventana(cursor, estacion, numero_parte, ventana, fecha_fmt, log)
+    disponibles = capacidades(cursor, estacion, numero_parte, ventana)
     reparto = repartir(incremento, multiplicador, disponibles)
 
     id_acumulador = None
     if any(a.es_no_planeado for a in reparto):
         id_acumulador, error = acumulador_no_planeado(
-            cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, flavor, log)
+            cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, ventana, log)
         if id_acumulador is None:
             return _sin_donde_registrar(resultado, error, incremento,
                                         numero_parte, estacion, log)
@@ -584,13 +691,13 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
     # orden se cerró entre la consulta y el UPDATE: el acumulador se pide aquí.
     if id_acumulador is None:
         id_acumulador, error = acumulador_no_planeado(
-            cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, flavor, log)
+            cursor, estacion, numero_parte, fecha_plan, turno, fecha_fmt, ventana, log)
         if id_acumulador is None:
             return _sin_donde_registrar(resultado, error, incremento,
                                         numero_parte, estacion, log)
 
     if sumar_a_no_planeado(cursor, id_acumulador, piezas_sueltas,
-                           fecha_fmt, fecha_plan, flavor) is None:
+                           fecha_fmt, fecha_plan, ventana.flavor) is None:
         # Otro proceso reclamó ese acumulado para una orden entre la búsqueda y
         # el UPDATE: le puso número de orden, así que ya no admite producción
         # suelta. Se pide otro, que nacerá limpio, y se reintenta UNA vez.
@@ -600,9 +707,9 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
         )
         id_acumulador, error = acumulador_no_planeado(
             cursor, estacion, numero_parte, fecha_plan, turno,
-            fecha_fmt, flavor, log)
+            fecha_fmt, ventana, log)
         if id_acumulador is None or sumar_a_no_planeado(
-                cursor, id_acumulador, piezas_sueltas, fecha_fmt, fecha_plan, flavor) is None:
+                cursor, id_acumulador, piezas_sueltas, fecha_fmt, fecha_plan, ventana.flavor) is None:
             return _sin_donde_registrar(resultado, error or "ACUMULADOR_NO_DISPONIBLE",
                                         incremento, numero_parte, estacion, log)
 
@@ -616,7 +723,7 @@ def registrar_incremento(cursor, estacion, numero_parte, incremento, multiplicad
         anotar_history(id_acumulador, None, incremento_suelto)
     resultado.incremento += incremento_suelto
 
-    regimen = "No planeado" if flavor == NO_PLANEADO else "No verificado"
+    regimen = "No planeado" if ventana.flavor == NO_PLANEADO else "No verificado"
     log.info(
         f"📦 {piezas_sueltas} piezas de {numero_parte} en {estacion} sin orden "
         f"(de un avance de {incremento} este ciclo): van al acumulador "

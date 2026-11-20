@@ -635,3 +635,40 @@ class TestRegimenPorEstacion:
 
         assert len(nuevos) == 1
         assert nuevos[0].status == ord_sql.NO_PLANEADO
+
+
+class TestCorteEnElRecolector:
+    """
+    Con corte el mismo día: el recolector lee la fecha de la estación en el
+    ciclo y la compara con la fecha del TURNO, no con la del reloj.
+    """
+
+    MADRUGADA = datetime(2026, 8, 19, 3, 0, 0)   # turno de noche del 18
+
+    def sembrar(self, base):
+        base.sync_from[ESTACION] = date(2026, 8, 19)
+        base.registros[101] = orden(101, "A18", planned=900, fecha="2026-08-18")
+        base.registros[102] = orden(102, "A19", planned=900, fecha="2026-08-19")
+
+    def test_desde_el_corte_llena_las_del_corte_y_no_las_de_antes(self, procesador, base):
+        self.sembrar(base)
+        procesar(procesador, [lectura(12)], ts=MANANA)
+
+        assert base[102].produced == 12
+        assert base[101].produced == 0
+
+    def test_la_madrugada_del_corte_todavia_es_del_dia_anterior(self, procesador, base):
+        self.sembrar(base)
+        procesar(procesador, [lectura(12)], ts=self.MADRUGADA)
+
+        assert base[101].produced == 12
+        assert base[102].produced == 0
+
+    def test_a_las_ocho_cruza_y_cierra_la_de_antes(self, procesador, base):
+        self.sembrar(base)
+        procesar(procesador, [lectura(12)], ts=self.MADRUGADA)
+        procesar(procesador, [lectura(20)], ts=MANANA)
+
+        assert (base[101].produced, base[101].status) == (12, ord_sql.DETENIDO)
+        assert base[102].produced == 8
+        assert base.conteo_en_histories() == 20, "ni una pieza perdida ni duplicada"

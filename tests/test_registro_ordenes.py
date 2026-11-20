@@ -21,16 +21,19 @@ HOY = date(2026, 8, 19)
 AHORA = "2026-08-19 07:30:00"
 ESTACION = "MK05"
 PARTE = "BDTS53411-BK"
+#: Un corte ya muy pasado: el mes completo y el sobrante a No planeado (24),
+#: como en las estaciones con sync_from desde septiembre.
+PASADO = date(2000, 1, 1)
 #: Para pruebas donde el cierre de un acumulador (detener()) debe caer en
-#: No planeado (24): una estación con sync_from ya muy pasado.
-SYNC_FROM_PASADO = {ESTACION: date(2000, 1, 1)}
+#: No planeado (24): la base falsa con ese mismo corte.
+SYNC_FROM_PASADO = {ESTACION: PASADO}
 
 
 def registrar(base, incremento, mult, estacion=ESTACION, parte=PARTE,
-              fecha_plan=HOY, flavor=ord_sql.NO_PLANEADO):
+              fecha_plan=HOY, sync_from=PASADO):
     return registrar_incremento(
         base, estacion, parte, incremento, mult,
-        fecha_plan=fecha_plan, turno=1, fecha_fmt=AHORA, flavor=flavor,
+        fecha_plan=fecha_plan, turno=1, fecha_fmt=AHORA, sync_from=sync_from,
         anotar_history=base.anotar_history, log=LOG,
     )
 
@@ -77,7 +80,7 @@ class TestCorridaNormal:
         registrar(base, incremento=1, mult=1)
         primero = base[101].production_start
         registrar_incremento(base, ESTACION, PARTE, 1, 1, HOY, 1,
-                             "2026-08-19 09:00:00",
+                             "2026-08-19 09:00:00", sync_from=PASADO,
                              anotar_history=base.anotar_history, log=LOG)
         assert base[101].production_start == primero
 
@@ -197,7 +200,7 @@ class TestNoPlaneado:
         base = BaseFalsa([], partes=[(ESTACION, PARTE)])
         registrar(base, incremento=5, mult=1)
         acumulador = base.acumuladores[0]
-        assert ord_sql.capacidades(base, ESTACION, PARTE, HOY) == []
+        assert ord_sql.capacidades(base, ESTACION, PARTE, ord_sql.ventana_de(HOY, PASADO)) == []
         assert acumulador.orden is None
 
     def test_parte_que_no_existe_reporta_error_sin_inventar_registros(self):
@@ -321,7 +324,7 @@ class TestFinDeCorrida:
 
         assert base[101].status == ord_sql.DETENIDO
         assert [c.id_registro for c in
-                ord_sql.capacidades(base, ESTACION, PARTE, HOY)] == [101]
+                ord_sql.capacidades(base, ESTACION, PARTE, ord_sql.ventana_de(HOY, PASADO))] == [101]
 
     def test_detener_no_toca_una_orden_pendiente(self):
         """El plan de producción no se cierra desde el recolector: ya nos pasó."""
@@ -523,7 +526,7 @@ class TestCicloDelAcumuladorNoVerificado:
 
     def test_nace_en_progreso_no_en_no_verificado(self):
         base = BaseFalsa([], partes=[(ESTACION, PARTE)])
-        registrar(base, incremento=5, mult=1, flavor=ord_sql.NO_VERIFICADO)
+        registrar(base, incremento=5, mult=1, sync_from=None)
 
         acumulador = base.acumuladores[0]
         assert acumulador.status == ord_sql.EN_PROGRESO
@@ -531,29 +534,29 @@ class TestCicloDelAcumuladorNoVerificado:
 
     def test_al_terminar_la_corrida_pasa_a_no_verificado_sin_sync_from(self):
         base = BaseFalsa([], partes=[(ESTACION, PARTE)])
-        r = registrar(base, incremento=5, mult=1, flavor=ord_sql.NO_VERIFICADO)
+        r = registrar(base, incremento=5, mult=1, sync_from=None)
         ord_sql.detener(base, r.en_curso, AHORA)
 
         assert base.acumuladores[0].status == ord_sql.NO_VERIFICADO
         assert base.acumuladores[0].produced == 5
 
-    def test_el_cierre_depende_del_sync_from_actual_no_del_flavor_usado(self):
+    def test_el_cierre_depende_del_sync_from_actual_no_del_que_se_uso_al_sumar(self):
         """
-        detener() decide con el sync_from de AHORA, no con el flavor que se
-        usó para sumar: si la estación ya tiene corte configurado y pasado,
-        cierra a 24 aunque la producción se sumó como No verificado.
+        detener() decide con el sync_from de AHORA, no con el que se usó para
+        sumar: si a la estación le configuran un corte ya pasado a media
+        corrida, cierra a 24 aunque la producción se sumó como No verificado.
         """
         base = BaseFalsa([], partes=[(ESTACION, PARTE)], sync_from=SYNC_FROM_PASADO)
-        r = registrar(base, incremento=5, mult=1, flavor=ord_sql.NO_VERIFICADO)
+        r = registrar(base, incremento=5, mult=1, sync_from=None)
         ord_sql.detener(base, r.en_curso, AHORA)
 
         assert base.acumuladores[0].status == ord_sql.NO_PLANEADO
 
     def test_se_reabre_si_vuelve_a_producir_el_mismo_mes(self):
         base = BaseFalsa([], partes=[(ESTACION, PARTE)])
-        r = registrar(base, incremento=5, mult=1, flavor=ord_sql.NO_VERIFICADO)
+        r = registrar(base, incremento=5, mult=1, sync_from=None)
         ord_sql.detener(base, r.en_curso, AHORA)
-        registrar(base, incremento=3, mult=1, flavor=ord_sql.NO_VERIFICADO)
+        registrar(base, incremento=3, mult=1, sync_from=None)
 
         assert len(base.acumuladores) == 1
         assert base.acumuladores[0].produced == 8
@@ -572,7 +575,7 @@ class TestUnSoloAcumuladorPorParte:
     def registrar_en(self, base, incremento, dia):
         return registrar_incremento(
             base, ESTACION, PARTE, incremento, 1,
-            fecha_plan=dia, turno=1, fecha_fmt=f"{dia} 07:30:00",
+            fecha_plan=dia, turno=1, fecha_fmt=f"{dia} 07:30:00", sync_from=PASADO,
             anotar_history=base.anotar_history, log=LOG,
         )
 
@@ -690,7 +693,7 @@ class TestElMesTambienAcotaElAcumulador:
         registrar_incremento(
             base, ESTACION, PARTE, 4, 1,
             fecha_plan=date(2026, 8, 25), turno=1, fecha_fmt="2026-08-25 07:30:00",
-            anotar_history=base.anotar_history, log=LOG)
+            sync_from=PASADO, anotar_history=base.anotar_history, log=LOG)
 
         nuevos = [a for a in base.acumuladores if a.id != 50]
         assert len(nuevos) == 1
@@ -705,31 +708,215 @@ class TestCambioDeMes:
     primero.
     """
 
-    @pytest.mark.parametrize("flavor", [ord_sql.NO_PLANEADO, ord_sql.NO_VERIFICADO])
-    def test_abre_uno_nuevo_y_no_toca_el_del_mes_anterior_ya_cerrado(self, flavor):
+    REGIMENES = [(PASADO, ord_sql.NO_PLANEADO), (None, ord_sql.NO_VERIFICADO)]
+
+    @pytest.mark.parametrize("corte,flavor", REGIMENES)
+    def test_abre_uno_nuevo_y_no_toca_el_del_mes_anterior_ya_cerrado(self, corte, flavor):
         viejo = Registro(50, ESTACION, PARTE, orden=None, planned=0, produced=40,
                          status=flavor, planned_date="2026-07-15")
         base = BaseFalsa([viejo], partes=[(ESTACION, PARTE)])
-        registrar(base, incremento=6, mult=1, flavor=flavor)
+        registrar(base, incremento=6, mult=1, sync_from=corte)
 
         assert base[50].produced == 40, "el del mes anterior no se toca"
         nuevos = [a for a in base.acumuladores if a.id != 50]
         assert len(nuevos) == 1
         assert nuevos[0].produced == 6
 
-    @pytest.mark.parametrize("flavor", [ord_sql.NO_PLANEADO, ord_sql.NO_VERIFICADO])
-    def test_cierra_el_del_mes_anterior_si_seguia_vivo(self, flavor):
+    @pytest.mark.parametrize("corte,flavor", REGIMENES)
+    def test_cierra_el_del_mes_anterior_si_seguia_vivo(self, corte, flavor):
         viejo = Registro(50, ESTACION, PARTE, orden=None, planned=0, produced=40,
                          status=ord_sql.EN_PROGRESO, planned_date="2026-07-15")
-        sync_from = SYNC_FROM_PASADO if flavor == ord_sql.NO_PLANEADO else {}
+        sync_from = {ESTACION: corte} if corte else {}
         base = BaseFalsa([viejo], partes=[(ESTACION, PARTE)], sync_from=sync_from)
-        registrar(base, incremento=6, mult=1, flavor=flavor)
+        registrar(base, incremento=6, mult=1, sync_from=corte)
 
         assert base[50].status == flavor, "cierra al status que le corresponde ahora"
         assert base[50].produced == 40, "su producción queda intacta"
         nuevos = [a for a in base.acumuladores if a.id != 50]
         assert len(nuevos) == 1
         assert nuevos[0].produced == 6
+
+
+class TestCorteDeLaEstacion:
+    """
+    El corte de la estación (sync_from) dice desde dónde se llenan órdenes,
+    dentro del mes. Lo pidió Moisés el 19-nov con corte el 20-nov; aquí, el
+    mismo caso con corte el 20-ago:
+
+      - lo de antes del 20 llena solo órdenes de antes, y lo que sobre va a 14;
+      - lo del 20 en adelante llena solo órdenes del 20 en adelante de ese mes,
+        y lo que sobre va a 24;
+      - el mes siguiente, normal;
+      - al cruzar el corte, lo que quedó En progreso del otro lado se cierra.
+    """
+
+    CORTE = date(2026, 8, 20)
+    DIA_19, DIA_20, DIA_25 = date(2026, 8, 19), date(2026, 8, 20), date(2026, 8, 25)
+
+    def base(self, *registros):
+        return BaseFalsa(list(registros), partes=[(ESTACION, PARTE)],
+                         sync_from={ESTACION: self.CORTE})
+
+    def registrar(self, base, incremento, dia):
+        return registrar(base, incremento, 1, fecha_plan=dia, sync_from=self.CORTE)
+
+    @staticmethod
+    def cierres(base):
+        """Las búsquedas de lo vivo del otro lado del corte."""
+        return [c for c in base.consultas if c == ord_sql.SQL_VIVOS_FUERA_DE_VENTANA]
+
+    # ── antes del corte
+    def test_antes_del_corte_llena_las_de_antes_y_no_toca_las_del_corte(self):
+        base = self.base(orden(101, "A15", planned=100, fecha="2026-08-15"),
+                         orden(102, "A20", planned=100, fecha="2026-08-20"))
+        self.registrar(base, 30, self.DIA_19)
+
+        assert base[101].produced == 30
+        assert (base[102].produced, base[102].status) == (0, ord_sql.PENDIENTE)
+
+    def test_antes_del_corte_sin_ordenes_de_antes_el_sobrante_va_a_14(self):
+        base = self.base(orden(102, "A20", planned=100, fecha="2026-08-20"))
+        r = self.registrar(base, 30, self.DIA_19)
+        ord_sql.detener(base, r.en_curso, AHORA)
+
+        assert base[102].produced == 0, "la del 20 espera al 20"
+        assert base[r.en_curso].produced == 30
+        assert base[r.en_curso].status == ord_sql.NO_VERIFICADO
+
+    # ── desde el corte
+    def test_desde_el_corte_el_20_es_la_mas_antigua(self):
+        base = self.base(orden(101, "A15", planned=100, fecha="2026-08-15"),
+                         orden(102, "A20", planned=100, fecha="2026-08-20"))
+        self.registrar(base, 30, self.DIA_20)
+
+        assert (base[101].produced, base[101].status) == (0, ord_sql.PENDIENTE)
+        assert base[102].produced == 30
+
+    def test_desde_el_corte_el_sobrante_va_a_24(self):
+        base = self.base(orden(101, "A15", planned=100, fecha="2026-08-15"))
+        r = self.registrar(base, 30, self.DIA_25)
+        ord_sql.detener(base, r.en_curso, AHORA)
+
+        assert base[101].produced == 0
+        assert base[r.en_curso].produced == 30
+        assert base[r.en_curso].status == ord_sql.NO_PLANEADO
+
+    def test_el_mes_sigue_siendo_el_marco(self):
+        """Lo del 25-ago no llena una orden del 1-sep, aunque ya exista."""
+        base = self.base(orden(103, "S01", planned=100, fecha="2026-09-01"))
+        r = self.registrar(base, 30, self.DIA_25)
+
+        assert base[103].produced == 0
+        assert r.no_planeado == 30
+
+    def test_el_mes_siguiente_llena_normal(self):
+        base = self.base(orden(103, "S01", planned=100, fecha="2026-09-01"),
+                         orden(104, "S03", planned=100, fecha="2026-09-03"))
+        self.registrar(base, 30, date(2026, 9, 2))
+
+        assert base[103].produced == 30, "en septiembre el corte ya no parte nada"
+        assert self.cierres(base) == []
+
+    # ── al cruzar el corte
+    def test_al_cruzar_cierra_la_orden_viva_de_antes_como_detenida(self):
+        base = self.base(orden(101, "A18", planned=100, produced=40,
+                               status=ord_sql.EN_PROGRESO, fecha="2026-08-18"),
+                         orden(102, "A20", planned=100, fecha="2026-08-20"))
+        self.registrar(base, 30, self.DIA_20)
+
+        assert (base[101].status, base[101].produced) == (ord_sql.DETENIDO, 40), \
+            "se cierra con lo suyo, sin mover producción"
+        assert base[102].produced == 30
+
+    def test_al_cruzar_cierra_el_acumulador_vivo_de_antes_en_14(self):
+        """Nada de lo juntado antes del corte pasa a 24."""
+        viejo = Registro(50, ESTACION, PARTE, orden=None, planned=0, produced=500,
+                         status=ord_sql.EN_PROGRESO, planned_date="2026-08-19")
+        base = self.base(viejo)
+        r = self.registrar(base, 30, self.DIA_20)
+        ord_sql.detener(base, r.en_curso, AHORA)
+
+        assert (base[50].status, base[50].produced) == (ord_sql.NO_VERIFICADO, 500)
+        assert r.en_curso != 50
+        assert (base[r.en_curso].status, base[r.en_curso].produced) == (ord_sql.NO_PLANEADO, 30)
+
+    def test_lo_cierra_aunque_todo_quepa_en_ordenes(self):
+        viejo = Registro(50, ESTACION, PARTE, orden=None, planned=0, produced=500,
+                         status=ord_sql.EN_PROGRESO, planned_date="2026-08-19")
+        base = self.base(viejo, orden(102, "A20", planned=100, fecha="2026-08-20"))
+        self.registrar(base, 30, self.DIA_20)
+
+        assert base[50].status == ord_sql.NO_VERIFICADO
+        assert base[102].produced == 30
+
+    def test_una_del_corte_que_se_llenaba_antes_se_cierra_y_espera_su_dia(self):
+        """
+        Le ponen fecha a una estación que el 19 ya llenaba una orden del 20
+        (como EFB SG-20B el 19-nov): se cierra Detenida, lo del 19 va a lo de
+        antes, y el 20 la retoma donde se quedó.
+        """
+        base = self.base(orden(102, "A20", planned=100, produced=25,
+                               status=ord_sql.EN_PROGRESO, fecha="2026-08-20"),
+                         orden(101, "A15", planned=100, fecha="2026-08-15"))
+        self.registrar(base, 10, self.DIA_19)
+
+        assert (base[102].status, base[102].produced) == (ord_sql.DETENIDO, 25)
+        assert base[101].produced == 10
+
+        self.registrar(base, 7, self.DIA_20)
+        assert (base[102].status, base[102].produced) == (ord_sql.EN_PROGRESO, 32)
+        assert base[101].status == ord_sql.DETENIDO, "y la del 15 queda cerrada del otro lado"
+
+    def test_no_toca_lo_vivo_de_otro_mes(self):
+        """El cierre del mes anterior sigue siendo del proceso externo, como hoy."""
+        julio = orden(90, "J30", planned=100, produced=10,
+                      status=ord_sql.EN_PROGRESO, fecha="2026-07-30")
+        base = self.base(julio)
+        self.registrar(base, 5, self.DIA_20)
+
+        assert base[90].status == ord_sql.EN_PROGRESO
+
+    def test_no_toca_otras_partes_ni_otras_estaciones(self):
+        otra_parte = Registro(60, ESTACION, "OTRA", orden="X18", planned=100, produced=5,
+                              status=ord_sql.EN_PROGRESO, planned_date="2026-08-18")
+        otra_estacion = Registro(61, "MK06", PARTE, orden="Y18", planned=100, produced=5,
+                                 status=ord_sql.EN_PROGRESO, planned_date="2026-08-18")
+        base = self.base(otra_parte, otra_estacion)
+        self.registrar(base, 5, self.DIA_20)
+
+        assert base[60].status == ord_sql.EN_PROGRESO
+        assert base[61].status == ord_sql.EN_PROGRESO
+
+    def test_no_se_pierde_ni_se_duplica_nada_al_cruzar(self):
+        base = self.base(orden(101, "A18", planned=100, produced=40,
+                               status=ord_sql.EN_PROGRESO, fecha="2026-08-18"),
+                         orden(102, "A20", planned=50, fecha="2026-08-20"))
+        self.registrar(base, 80, self.DIA_20)
+
+        assert base.total_producido() == 40 + 80
+        assert base.total_conteo() == 80
+        assert base[102].status == ord_sql.COMPLETADO
+        assert base[101].status == ord_sql.DETENIDO
+
+    def test_cuesta_una_consulta_de_mas_por_incremento_mientras_parte_el_mes(self):
+        base = self.base(orden(101, "A15", planned=100, fecha="2026-08-15"))
+        self.registrar(base, 5, self.DIA_19)
+        self.registrar(base, 5, self.DIA_19)
+
+        assert len(self.cierres(base)) == 2
+
+    # ── sin corte dentro del mes: igual que hoy
+    @pytest.mark.parametrize("corte", [None, date(2026, 7, 1), date(2026, 9, 5)])
+    def test_sin_corte_dentro_del_mes_todo_igual_que_hoy(self, corte):
+        """Sin fila, con un corte pasado o con uno futuro: el mes completo."""
+        base = BaseFalsa([orden(101, "A15", planned=100, fecha="2026-08-15"),
+                          orden(102, "A20", planned=100, fecha="2026-08-20")],
+                         partes=[(ESTACION, PARTE)])
+        registrar(base, 130, 1, fecha_plan=self.DIA_19, sync_from=corte)
+
+        assert base[101].produced == 100 and base[102].produced == 30, \
+            "todo el mes, de la más antigua a la más nueva"
+        assert self.cierres(base) == [], "sin corte dentro del mes no hay consulta de más"
 
 
 class TestCuandoUnaOrdenReclamaElAcumulado:
@@ -806,8 +993,8 @@ class BaseQueReclamaAMediaEscritura(BaseFalsa):
         super().__init__(*a, **kw)
         self.reclamados = []
 
-    def _buscar_no_planeado(self, estacion, numero, flavor, mes_inicio, mes_fin):
-        filas = super()._buscar_no_planeado(estacion, numero, flavor, mes_inicio, mes_fin)
+    def _buscar_no_planeado(self, estacion, numero, flavor, desde, hasta):
+        filas = super()._buscar_no_planeado(estacion, numero, flavor, desde, hasta)
         if filas and filas[0][0] not in self.reclamados:
             id_registro = filas[0][0]
             self.reclamados.append(id_registro)
@@ -853,7 +1040,7 @@ class TestElAcumuladorReclamadoAMediaEscritura:
         espia = LogEspia()
         base = BaseQueReclamaAMediaEscritura([], partes=[(ESTACION, PARTE)])
         registrar(base, incremento=10, mult=1)      # crea el acumulador
-        registrar_incremento(base, ESTACION, PARTE, 7, 1, HOY, 1, AHORA,
+        registrar_incremento(base, ESTACION, PARTE, 7, 1, HOY, 1, AHORA, sync_from=PASADO,
                              anotar_history=base.anotar_history, log=espia)  # lo reclaman
 
         assert any("reclamado" in a for a in espia.avisos), espia.avisos
