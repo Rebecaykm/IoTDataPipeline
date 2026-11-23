@@ -68,6 +68,12 @@ piezas_fantasma_evitadas = Counter(
     "Piezas que se habrían registrado de más al cambiar de número de parte",
     ["estacion", "lado"],
 )
+conteo_sin_registrar = Counter(
+    "conteo_sin_registrar_total",
+    "Avance del contador mientras el lado traía un número rechazado o venía en "
+    "blanco, que ninguna parte heredó: golpes en Estampado, piezas en las demás",
+    ["estacion", "lado"],
+)
 ordenes_completadas = Counter(
     "ordenes_completadas_total", "Órdenes que llegaron a su cantidad planeada",
     ["estacion", "area"],

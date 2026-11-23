@@ -38,6 +38,31 @@ Qué guarda cada entrada de `lados` (clave "ESTACION_LADO"):
 Los archivos escritos antes de `lados` son un diccionario plano de partes. Se
 leen igual y `lados` arranca vacío: mientras no haya observación de un lado se
 decide como antes, que es el comportamiento seguro.
+
+Y una tercera sección, `tramos`, por la misma razón que `lados`. Mientras el PLC
+manda en un lado un número rechazado (un MDI que no existe, una parte sin
+catálogo) o el lado viene en blanco, nadie registra y `lados` no se mueve, pero
+el registro sí avanza. Sin el tramo, la siguiente parte DISTINTA que llegaba al
+lado arrancaba desde el último valor registrado y se llevaba todo ese avance.
+Ver Prensas.IPDataProcessor._seguir_tramo.
+
+Qué guarda cada entrada de `tramos` (clave "ESTACION_LADO"):
+    tipo     TRAMO_RECHAZO o TRAMO_EN_BLANCO
+    numero   lo que mandó el PLC (vacío si el lado venía en blanco)
+    motivo   el código del rechazo, o LADO_EN_BLANCO
+    antes    con el lado en blanco, la parte que lo ocupaba justo antes; si es
+             ella la que vuelve, el tramo es suyo
+    desde    cuándo empezó el tramo
+    base     en cuánto venía el registro al empezar el tramo, o None si el lado
+             no tenía observación; desde ahí cuenta la parte dueña del tramo
+    ultimo   último valor leído del registro durante el tramo; desde ahí arranca
+             cualquier otra parte
+    golpes   cuánto avanzó el registro durante el tramo, en la unidad del área
+    unidad   'golpes' o 'piezas', para el log
+
+Un archivo sin `tramos` se lee igual y la sección arranca vacía. Así, quien
+regrese a la versión anterior del recolector no tiene que tocar el archivo: esa
+versión ignora la sección.
 """
 
 import json
@@ -51,6 +76,10 @@ logger = logging.getLogger("supervisor")
 #: Versión del formato en disco. 1 era un diccionario plano de partes.
 VERSION = 2
 
+#: Los dos tipos de tramo sin registrar (ver `tramos` en el docstring).
+TRAMO_RECHAZO = "rechazo"
+TRAMO_EN_BLANCO = "blanco"
+
 #: Campos que escribía el modelo por día y turno. Ya no los produce ni los lee
 #: nadie, pero siguen en los archivos de estado anteriores al cambio.
 OBSOLETOS = ("id_registro", "hora_cambio", "quantity_planeada",
@@ -58,7 +87,7 @@ OBSOLETOS = ("id_registro", "hora_cambio", "quantity_planeada",
              "delta_inicial", "cerrado_por_turno")
 
 
-def guardar_estado(state_file, active_records, ip, contadores_lado=None):
+def guardar_estado(state_file, active_records, ip, contadores_lado=None, tramos_lado=None):
     """
     Guarda el estado de forma ATÓMICA: temporal + fsync + os.replace.
 
@@ -69,7 +98,7 @@ def guardar_estado(state_file, active_records, ip, contadores_lado=None):
     Con os.replace el archivo final nunca queda a medias: o tiene el contenido
     viejo completo, o el nuevo completo.
 
-    Las dos secciones se escriben JUNTAS, en el mismo archivo y la misma
+    Las secciones se escriben JUNTAS, en el mismo archivo y la misma
     operación atómica: si los contadores por lado pudieran quedar de un ciclo
     distinto que las líneas base, la comparación entre ambos no significaría
     nada y volverían los fantasmas que `lados` existe para evitar.
@@ -80,6 +109,7 @@ def guardar_estado(state_file, active_records, ip, contadores_lado=None):
             "version": VERSION,
             "partes": active_records,
             "lados": contadores_lado or {},
+            "tramos": tramos_lado or {},
         }
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=4, ensure_ascii=False)
@@ -189,6 +219,47 @@ def cargar_contadores_lado(state_file, ip):
     return contadores
 
 
+def cargar_tramos_lado(state_file, ip):
+    """
+    Lee los tramos sin registrar que quedaron abiertos por (ESTACIÓN, LADO).
+    {} si no hay.
+
+    Un archivo sin esta sección da {} y eso es seguro. El primer rechazo o lado
+    en blanco que se lea después de arrancar abre su tramo desde `lados`, que
+    sí está guardado: lo que el registro avanzó mientras el servicio estaba
+    detenido queda dentro del tramo y no lo hereda nadie.
+
+    Una entrada que no se entienda se descarta sola, sin tumbar las demás.
+    """
+    data = _leer_archivo(state_file, ip)
+    if data is None or not _es_envuelto(data):
+        return {}
+
+    crudas = data.get("tramos")
+    if not isinstance(crudas, dict):
+        return {}
+
+    def entero(valor):
+        # bool es subclase de int y un True aquí no significa nada.
+        return isinstance(valor, int) and not isinstance(valor, bool)
+
+    tramos = {}
+    for clave, tramo in crudas.items():
+        if not isinstance(tramo, dict):
+            continue
+        if tramo.get('tipo') not in (TRAMO_RECHAZO, TRAMO_EN_BLANCO):
+            continue
+        if not entero(tramo.get('ultimo')) or not entero(tramo.get('golpes')):
+            continue
+        if tramo.get('base') is not None and not entero(tramo.get('base')):
+            continue
+        tramos[clave] = tramo
+
+    if tramos:
+        logger.info(f"Tramos sin registrar recuperados para {ip}: {len(tramos)}.")
+    return tramos
+
+
 def _es_envuelto(data):
     """Formato con versión (trae `partes`) vs. diccionario plano de partes."""
     return isinstance(data, dict) and isinstance(data.get("partes"), dict)
@@ -199,7 +270,7 @@ def _leer_archivo(state_file, ip):
     JSON crudo del archivo de estado, o None si no hay o no se pudo leer.
 
     Se llama una vez por sección y solo al arrancar, así que leer el archivo
-    dos veces no cuesta nada y evita acoplar las dos cargas.
+    varias veces no cuesta nada y evita acoplar las cargas.
     """
     if not state_file.exists():
         return None

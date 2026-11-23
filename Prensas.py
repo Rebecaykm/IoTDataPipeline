@@ -93,6 +93,15 @@ VENTANA_PURGA_ARRANQUE = 24 * 3600   # segundos
 BD_INTENTOS_INTERBLOQUEO = 3
 BD_ESPERA_REINTENTO = 0.25   # segundos, multiplicados por el número de intento
 
+#: Rechazos que se arreglan solos: la base no respondió, o a la mitad del
+#: registro otro proceso se quedó con el acumulador. La MISMA parte reintenta
+#: con el delta completo en el siguiente ciclo, así que no abren tramo sin
+#: registrar. Cualquier otro rechazo sí lo abre (ver
+#: IPDataProcessor._seguir_tramo): un MDI que no existe, una parte sin catálogo.
+#: Si algún día aparece un código nuevo, cae del lado seguro: no se lo hereda
+#: ninguna otra parte.
+RECHAZOS_PASAJEROS = frozenset({"SIN_CONEXION_BD", "DB_ERROR", "ACUMULADOR_NO_DISPONIBLE"})
+
 FORMATO_LOG = '%(asctime)s - %(levelname)s - %(message)s'
 
 
@@ -638,8 +647,10 @@ class IPDataCollector:
         # renglón en el log en cada ciclo (ver _process_station_data).
         self._ultima_division = {}
         # Lados que el PLC respondió SIN número de parte en la última lectura,
-        # por estación. No son producción ni viajan al procesador: solo
-        # alimentan el tablero de lecturas en vivo (ver collect_and_enqueue).
+        # por estación. No son producción: alimentan el tablero de lecturas en
+        # vivo y viajan al procesador aparte, en `en_blanco`, porque lo que
+        # avance ese registro mientras tanto no es de nadie (ver
+        # collect_and_enqueue e IPDataProcessor._seguir_tramo).
         self._sin_parte = {}
 
     def _parse_tag(self, tag_name):
@@ -847,10 +858,12 @@ class IPDataCollector:
                     'lado': grp  # 🆕 Identificar el lado/grupo
                 })
             else:
-                # El PLC respondió y el lado viene en blanco. Para el conteo no
-                # es nada —por eso no entra a datos_estacion—, pero el tablero
+                # El PLC respondió y el lado viene en blanco. No es producción
+                # de nadie —por eso no entra a datos_estacion—, pero el tablero
                 # de lecturas en vivo tiene que verlo o se queda mostrando el
-                # último número que ese lado tuvo.
+                # último número que ese lado tuvo. Y el procesador también: si
+                # el registro avanza en blanco, la parte que llegue después no
+                # se puede llevar ese avance.
                 self._sin_parte[estacion].append({
                     'lado': grp,
                     'contador': data['contador'],
@@ -926,9 +939,14 @@ class IPDataCollector:
                         est, cfg, block_data, now)
                 else:
                     datos_estacion = self._process_station_data(est, cfg, block_data, now)
+                # Los lados en blanco, con su contador: el procesador los sigue
+                # en un tramo sin registrar (ver IPDataProcessor._seguir_tramo).
+                en_blanco = [{'lado': v['lado'], 'contador': v['contador']}
+                             for v in self._sin_parte.get(est, [])]
                 if datos_estacion:
                     batch.append({'estacion': est, 'datos': datos_estacion, 'ts': now,
-                                  'area': self.area, 'plc_ok': lectura_ok})
+                                  'area': self.area, 'plc_ok': lectura_ok,
+                                  'en_blanco': en_blanco})
                 else:
                     if not lectura_ok:
                         try:
@@ -939,7 +957,8 @@ class IPDataCollector:
                             f"⚠️ Lectura incompleta de {est} en PLC {self.ip}: "
                             f"se preserva el estado en caché (no se cierran registros)."
                         )
-                    batch.append({'estacion': est, 'datos': [], 'ts': now, 'area': self.area, 'plc_ok': lectura_ok})
+                    batch.append({'estacion': est, 'datos': [], 'ts': now, 'area': self.area,
+                                  'plc_ok': lectura_ok, 'en_blanco': en_blanco})
 
             # Lecturas en vivo por estación/lado, con la MISMA conexión al PLC.
             # Alimenta /estaciones/lecturas: ver los valores en tiempo real sin
@@ -999,6 +1018,51 @@ class IPDataCollector:
             raise
 # ═══════════════════════════ PROCESADOR (CONSUMIDOR) ═══════════════════════════
 
+def _sin_espacios(texto):
+    """Lo que manda el PLC, comparable: sin espacios, como lo compara el catálogo."""
+    return "".join(str(texto or "").split())
+
+
+def _quien_ocupa(tipo, numero):
+    """Cómo se nombra en el log lo que el PLC mandaba durante un tramo."""
+    if tipo == estado_store.TRAMO_EN_BLANCO:
+        return "el lado venía en blanco"
+    return f"se rechazaba '{numero}'"
+
+
+class _LadosDelCiclo:
+    """
+    Quién se quedó con el movimiento de cada lado en UN ciclo de una estación.
+
+    Al final del ciclo dice, por lado, si alguna parte válida contó: entonces
+    el lado tuvo dueño, y si traía un tramo sin registrar, ese tramo se cierra.
+    Si todo lo que hubo fueron rechazos permanentes, el tramo se abre o sigue
+    (ver IPDataProcessor._seguir_tramo).
+
+    Se decide al final y no al vuelo porque un mismo lado puede traer varias
+    partes. Un troquel que saca dos números por golpe, uno sin catálogo y otro
+    que sí registra, tiene dueño. Si se decidiera con la primera parte que
+    pasa, el rechazo de la otra abriría un tramo que no existe.
+    """
+
+    def __init__(self):
+        self.validas = defaultdict(int)      # partes válidas que llegaron a contar
+        self.rechazadas = defaultdict(int)   # de esas, cuántas rechazó la base
+        self.rechazos = {}                   # lado -> (numero, motivo, contador, desde)
+        self.al_llegar = {}                  # lado -> (retoma, base) frente a su tramo
+
+    def rechazo(self, lado, numero, motivo, contador, desde=None, de_parte_valida=False):
+        """Un rechazo en el lado. Los pasajeros no cuentan (ver RECHAZOS_PASAJEROS)."""
+        if motivo in RECHAZOS_PASAJEROS:
+            return
+        if de_parte_valida:
+            self.rechazadas[lado] += 1
+        self.rechazos.setdefault(lado, (numero, motivo, contador, desde))
+
+    def tiene_dueno(self, lado):
+        return self.validas[lado] > self.rechazadas[lado]
+
+
 class IPDataProcessor:
     def __init__(self, ip):
         self.ip = ip
@@ -1007,6 +1071,9 @@ class IPDataProcessor:
         # mostraba. El registro del PLC es del lado y lo comparten las partes que
         # pasan por él; ver persistence/estado.py para por qué hace falta.
         self.contadores_lado = {}
+        # Por (ESTACIÓN, LADO): lo que avanzó el registro mientras el PLC
+        # mandaba un número rechazado o el lado en blanco. Ver _seguir_tramo.
+        self.tramos_lado = {}
         self.last_scanned_parts = {}  # 🆕 Polling optimization cache
         # Estaciones paradas (lectura completa, sin partes) a las que ya se les
         # cerró lo que tenían abierto. Mientras sigan así no se vuelve a tocar
@@ -1022,12 +1089,13 @@ class IPDataProcessor:
         self.active_records = estado_store.cargar_estado(self.state_file, self.ip)
         self.contadores_lado = estado_store.cargar_contadores_lado(
             self.state_file, self.ip)
+        self.tramos_lado = estado_store.cargar_tramos_lado(self.state_file, self.ip)
         self._purgar_huerfanas_al_arrancar()
 
     def save_state(self):
         """Guarda el estado. La escritura atómica vive en persistence/estado.py"""
         estado_store.guardar_estado(self.state_file, self.active_records, self.ip,
-                                    self.contadores_lado)
+                                    self.contadores_lado, self.tramos_lado)
 
     def _purgar_huerfanas_al_arrancar(self):
         """
@@ -1116,6 +1184,171 @@ class IPDataProcessor:
             'contador': contador,
             'visto_en': system_time.time(),
         }
+
+    def _seguir_tramo(self, estacion, lado, tipo, numero, motivo, cnt, fecha_fmt,
+                      unidad, log, desde=None, antes=None):
+        """
+        Lleva la cuenta de lo que avanza el registro de un lado que NADIE puede
+        registrar: el PLC manda un número rechazado, o el lado viene en blanco.
+        Devuelve True si cambió algo que haya que guardar.
+
+        Sin esto, `contadores_lado` se quedaba en el último valor registrado
+        mientras el registro seguía subiendo. La siguiente parte DISTINTA que
+        llegaba al lado arrancaba desde ahí y se llevaba todo el tramo. El caso
+        real, de la 1200T AP el 19-nov:
+          - DGJ428B04A se registró hasta 1,228;
+          - el troquel 'VA4050083', cuyo MDI no existe, dio 1,117 golpes hasta 2,345;
+          - BDTT70662 llegó sin reiniciar el contador y se llevó los 1,117.
+
+        Aquí `contadores_lado` NO se toca. Mientras el tramo siga abierto, la
+        misma parte que se rechaza tiene que poder reintentar con el delta
+        completo, para recuperarlo si la dan de alta (ver _rechazar_en_bd).
+        Quién se queda con el tramo se decide cuando llega una parte válida
+        (ver _base_tras_tramo).
+
+        Si lo que manda el PLC cambia y sigue sin haber parte válida (otro
+        número rechazado, o del rechazo al lado en blanco), el tramo anterior se
+        cierra sin dueño. El nuevo cuenta desde donde ese terminó.
+
+        `desde` es de dónde contó su delta la parte rechazada, si lo hubo: solo
+        hace que la cuenta de `golpes` empiece bien. `antes` es la parte que
+        ocupaba el lado justo antes de quedar en blanco.
+        """
+        clave = f"{estacion}_{lado}"
+        tramo = self.tramos_lado.get(clave)
+        if (tramo is not None and tramo['tipo'] == tipo
+                and _sin_espacios(tramo.get('numero')) == _sin_espacios(numero)):
+            if cnt == tramo['ultimo']:
+                return False
+            avance, _ = calcular_incremento(tramo['ultimo'], cnt)
+            tramo['golpes'] += avance
+            tramo['ultimo'] = cnt
+            return True
+
+        if tramo is not None:
+            self._cerrar_tramo(estacion, lado, fecha_fmt, log)
+            base, antes = tramo['ultimo'], None
+        else:
+            base = self._contador_del_lado(estacion, lado)
+        desde = base if desde is None else desde
+        golpes = calcular_incremento(desde, cnt)[0] if desde is not None else 0
+        self.tramos_lado[clave] = {
+            'tipo': tipo, 'numero': numero or '', 'motivo': motivo, 'antes': antes,
+            'desde': fecha_fmt, 'base': base, 'ultimo': cnt, 'golpes': golpes,
+            'unidad': unidad,
+        }
+        log.info(
+            f"🧾 {estacion}/{lado}: {_quien_ocupa(tipo, numero)} ({motivo}) con el "
+            f"registro en {cnt}. Lo que avance mientras siga así no se le carga a "
+            f"la parte que llegue después."
+        )
+        return True
+
+    def _base_tras_tramo(self, tramo, num_orig):
+        """
+        Una parte VÁLIDA llega a un lado con el tramo abierto. Devuelve
+        (retoma, base): si el tramo es suyo, y desde dónde cuenta.
+
+        El tramo es suyo en dos casos:
+          - es el mismo número que el PLC venía mandando y ahora sí resuelve,
+            porque lo dieron de alta;
+          - el lado venía en blanco y regresa la parte que estaba antes.
+        Entonces cuenta desde `base`, como si el tramo no hubiera existido, que
+        es lo que hacía el código antes de este arreglo.
+
+        Cualquier otra parte arranca en `ultimo`, el último valor que se leyó
+        durante el tramo, y no hereda nada.
+        """
+        if tramo['tipo'] == estado_store.TRAMO_EN_BLANCO:
+            suyo = (bool(tramo.get('antes'))
+                    and _sin_espacios(tramo['antes']) == _sin_espacios(num_orig))
+        else:
+            suyo = _sin_espacios(tramo.get('numero')) == _sin_espacios(num_orig)
+        return (True, tramo.get('base')) if suyo else (False, tramo['ultimo'])
+
+    def _cerrar_tramo(self, estacion, lado, fecha_fmt, log, parte=None, retoma=False,
+                      base=None):
+        """
+        Cierra el tramo del lado, si hay uno.
+
+        `parte` es la parte válida que llegó y lo cierra. Es None si lo cerró
+        otro rechazo (ver _seguir_tramo). `retoma` dice si el tramo era suyo.
+        `base` es desde dónde cuenta esa parte. Se anota como el registro del
+        lado: si la parte no avanza en este ciclo, el siguiente tiene que
+        comparar contra eso y no contra lo de antes del tramo.
+        """
+        tramo = self.tramos_lado.pop(f"{estacion}_{lado}", None)
+        if tramo is None:
+            return
+        if base is not None:
+            self._anotar_contador_lado(estacion, lado, base)
+
+        cuanto = f"{tramo['golpes']} {tramo.get('unidad') or 'golpes'}"
+        periodo = f"{tramo.get('desde', '?')} a {fecha_fmt}"
+        if retoma:
+            por_que = ("es la que estaba antes de que el lado quedara en blanco"
+                       if tramo['tipo'] == estado_store.TRAMO_EN_BLANCO
+                       else f"'{tramo.get('numero')}' ya existe en el catálogo")
+            log.info(f"↩️ {estacion}/{lado}: {parte} se queda con los {cuanto} del "
+                     f"tramo ({periodo}): {por_que}.")
+            return
+
+        quien = _quien_ocupa(tramo['tipo'], tramo.get('numero'))
+        siguiente = (f"{parte} arranca en {tramo['ultimo']} y no los hereda." if parte
+                     else "No los hereda nadie.")
+        mensaje = f"🧾 {estacion}/{lado}: {cuanto} sin registrar mientras {quien} ({periodo}). {siguiente}"
+        if tramo['golpes']:
+            log.warning(mensaje)
+        else:
+            log.info(mensaje)
+        try:
+            obs_metricas.conteo_sin_registrar.labels(estacion, lado).inc(tramo['golpes'])
+        except Exception:
+            pass
+
+    def _ultima_parte_del_lado(self, estacion, lado):
+        """Lo que mandaba el PLC la última vez que una parte válida ocupó el lado."""
+        en_el_lado = [reg for clave, reg in self.active_records.items()
+                      if clave.startswith(f"{estacion}_") and reg.get('lado') == lado]
+        if not en_el_lado:
+            return None
+        return max(en_el_lado, key=lambda reg: reg.get('visto_en', 0)).get('numero_original')
+
+    def _seguir_lados_en_blanco(self, pkg):
+        """
+        Sigue el tramo de cada lado que el PLC mandó en blanco (ver
+        _seguir_tramo). True si cambió algo que haya que guardar.
+
+        Corre antes que todo lo demás del ciclo, así todavía se sabe qué parte
+        ocupaba el lado, y sin esperar al commit: no escribe en la base, y
+        repetirlo con la misma lectura no cambia nada.
+
+        Con lectura parcial no se hace nada: un bloque que falló deja el lado
+        sin número aunque el PLC sí lo esté mandando.
+        """
+        if not pkg.get('plc_ok', True) or not pkg.get('en_blanco'):
+            return False
+        estacion = pkg['estacion']
+        log = get_station_logger(estacion)
+        fecha_fmt = pkg['ts'].strftime('%Y-%m-%d %H:%M:%S')
+        unidad = ("golpes" if obtener_pipeline(pkg.get('area', 'Default')).usa_multiplicador
+                  else "piezas")
+
+        hubo_cambios = False
+        for en_blanco in pkg['en_blanco']:
+            lado = en_blanco.get('lado', '--')
+            try:
+                cnt = int(en_blanco['contador'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            antes = None
+            if f"{estacion}_{lado}" not in self.tramos_lado:
+                antes = self._ultima_parte_del_lado(estacion, lado)
+            if self._seguir_tramo(estacion, lado, estado_store.TRAMO_EN_BLANCO, '',
+                                  'LADO_EN_BLANCO', cnt, fecha_fmt, unidad, log,
+                                  antes=antes):
+                hubo_cambios = True
+        return hubo_cambios
 
     def _linea_base_de_corrida(self, cursor, estacion, num, cnt, log,
                                corridas_previas, contador_lado=None):
@@ -1237,6 +1470,15 @@ class IPDataProcessor:
 
     def _process_estacion(self, pkg):
         """
+        Un paquete del lector para una estación. Los lados en blanco no viajan
+        en `datos`, porque no son producción de nadie: se siguen aparte y
+        primero (ver _seguir_lados_en_blanco). El resto es _registrar_estacion.
+        """
+        hubo_tramos = self._seguir_lados_en_blanco(pkg)
+        return self._registrar_estacion(pkg) or hubo_tramos
+
+    def _registrar_estacion(self, pkg):
+        """
         Registra lo que produjo una estación desde la lectura anterior.
 
         El modelo es LLENAR ÓRDENES: cada incremento del contador busca la orden
@@ -1280,6 +1522,7 @@ class IPDataProcessor:
             return False
 
         pipeline = obtener_pipeline(area)
+        unidad = "golpes" if pipeline.usa_multiplicador else "piezas"
         # El ciclo completo se reintenta ante un interbloqueo: la victima de
         # SQL Server pierde TODA su transaccion, y sin reintento se perdia la
         # produccion de ese ciclo para siempre (ver es_interbloqueo).
@@ -1302,6 +1545,11 @@ class IPDataProcessor:
                     # revertía pero la línea base ya había avanzado, y esa produccion
                     # no se volvía a intentar nunca. Se perdía en silencio.
                     diferidos = []
+
+                    # Quién contó en cada lado en ESTE intento, para decidir al
+                    # final qué pasa con los tramos sin registrar (ver
+                    # _LadosDelCiclo). Se rehace en cada intento, como diferidos.
+                    lados = _LadosDelCiclo()
 
                     if not datos:
                         # Lectura buena y sin partes: la estación dejó de
@@ -1461,6 +1709,7 @@ class IPDataProcessor:
                             if error_val:
                                 registrar_error_validacion(estacion, num_orig, error_val,
                                                            lado=lado_actual, area=area)
+                            lados.rechazo(lado_actual, num_orig, error_val or "NO_PART_NUMBER", cnt)
                             continue
 
                         clave = f"{estacion}_{num}_{lado_actual}"
@@ -1474,6 +1723,28 @@ class IPDataProcessor:
                         # del ciclo, en vez de que la primera se lleve el
                         # incremento y las demás vean cero.
                         prev_lado = self._contador_del_lado(estacion, lado_actual)
+
+                        # Si el lado viene de un tramo sin registrar, de ahí sale
+                        # desde dónde cuenta esta parte (ver _base_tras_tramo).
+                        # Se decide UNA vez por lado, por la misma razón que arriba:
+                        # todas las partes del golpe ven lo mismo. El tramo se
+                        # cierra hasta el commit y solo si alguna parte del lado
+                        # sí contó. Si todas se rechazan, sigue abierto.
+                        tramo = self.tramos_lado.get(f"{estacion}_{lado_actual}")
+                        if tramo is not None:
+                            if lado_actual not in lados.al_llegar:
+                                lados.al_llegar[lado_actual] = self._base_tras_tramo(tramo, num_orig)
+
+                                def cerrar_tramo(est=estacion, lad=lado_actual, parte=num,
+                                                 decision=lados.al_llegar[lado_actual],
+                                                 ciclo=lados, fecha=fecha_fmt, log=log):
+                                    if ciclo.tiene_dueno(lad):
+                                        self._cerrar_tramo(est, lad, fecha, log, parte=parte,
+                                                           retoma=decision[0], base=decision[1])
+                                diferidos.append(cerrar_tramo)
+                                state_changed = True
+                            prev_lado = lados.al_llegar[lado_actual][1]
+                        lados.validas[lado_actual] += 1
 
                         if reg is None:
                             base = self._linea_base_de_corrida(
@@ -1618,6 +1889,8 @@ class IPDataProcessor:
                                 # suponer 1 pieza por golpe registraría de menos.
                                 self._rechazar_en_bd(estacion, lado_actual, num_orig, num, cnt,
                                                      area, "PART_NUMBER_NO_EXISTE_BD", log)
+                                lados.rechazo(lado_actual, num_orig, "PART_NUMBER_NO_EXISTE_BD",
+                                              cnt, desde=prev, de_parte_valida=True)
                                 continue
                             multiplicador = catalogo.obtener_multiplicador(cursor, part_number_id)
                             anterior = reg.get('multiplicador')
@@ -1660,6 +1933,8 @@ class IPDataProcessor:
                         if resultado.error:
                             self._rechazar_en_bd(estacion, lado_actual, num_orig, num, cnt,
                                                  area, resultado.error, log)
+                            lados.rechazo(lado_actual, num_orig, resultado.error, cnt,
+                                          desde=prev, de_parte_valida=True)
                             continue
 
                         def avanzar(r=reg, c=cnt, curso=resultado.en_curso,
@@ -1692,6 +1967,18 @@ class IPDataProcessor:
                                 obs_metricas.plc_tiempo_ciclo.labels(estacion, lado_actual).set(tiempo)
                         except Exception:
                             pass
+
+                    # Lados donde solo hubo rechazos permanentes: lo que avanzó
+                    # su registro no es de nadie y queda en el tramo (ver
+                    # _seguir_tramo). Si otra parte del mismo lado sí contó, el
+                    # lado tuvo dueño y no hay tramo.
+                    for lado, (numero, motivo, contador, desde) in lados.rechazos.items():
+                        if lados.tiene_dueno(lado):
+                            continue
+                        diferidos.append(functools.partial(
+                            self._seguir_tramo, estacion, lado, estado_store.TRAMO_RECHAZO,
+                            numero, motivo, contador, fecha_fmt, unidad, log, desde=desde))
+                        state_changed = True
 
                     conn.commit()
 
